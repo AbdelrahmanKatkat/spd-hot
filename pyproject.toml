@@ -19,10 +19,12 @@ dependencies = [
 train = [
     "onnx>=1.17",
     "onnxscript>=0.1",
+    "shapely>=2.0",
     "ultralytics>=8.4.0",
 ]
 test = [
     "pytest>=8.0",
+    "shapely>=2.0",
 ]
 
 [tool.pytest.ini_options]

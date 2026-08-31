@@ -40,8 +40,6 @@ class PreprocessParams:
     # Chips coming from fAIr are usually 256×256, but allow any size.
     chip_size_hint: int = 256
 
-    # Output tensor layout for ONNX session input: NCHW (1,3,H,W).
-    nchw: bool = True
     # Normalization: uint8 [0..255] -> float32 [0..1]
     normalize_01: bool = True
 
@@ -124,7 +122,6 @@ def parse_preprocess_params(hyperparameters: Mapping[str, Any] | None) -> Prepro
     return PreprocessParams(
         model_input_size=_as_int(_get(hp, "model_input_size", PreprocessParams.model_input_size)),
         chip_size_hint=_as_int(_get(hp, "chip_size", PreprocessParams.chip_size_hint)),
-        nchw=_as_bool(_get(hp, "nchw", PreprocessParams.nchw)),
         normalize_01=_as_bool(_get(hp, "normalize_01", PreprocessParams.normalize_01)),
     )
 

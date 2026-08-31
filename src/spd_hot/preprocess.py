@@ -34,7 +34,7 @@ def _resize_rgb(rgb_hwc: np.ndarray, target_size: int) -> tuple[np.ndarray, floa
 def preprocess_chip_for_onnx(image_path: str | Path, cfg: PreprocessParams | None = None) -> tuple[np.ndarray, PreprocessMeta]:
     """Read one chip and return ONNX-ready tensor and metadata.
 
-    Output tensor shape is `(1, 3, size, size)` when `cfg.nchw` is True.
+    Output tensor shape is always `(1, 3, size, size)` (NCHW).
     """
 
     cfg = cfg or PreprocessParams()
@@ -57,10 +57,7 @@ def preprocess_chip_for_onnx(image_path: str | Path, cfg: PreprocessParams | Non
     if cfg.normalize_01:
         arr = arr / 255.0
 
-    if cfg.nchw:
-        batch = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
-    else:
-        batch = arr[np.newaxis, ...]
+    batch = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
 
     meta = PreprocessMeta(
         width=width,

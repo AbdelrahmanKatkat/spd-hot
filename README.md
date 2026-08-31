@@ -1,164 +1,260 @@
-# `spd-hot` (Swimming Pool Detector for HOT fAIr)
+# `spd-hot`
 
-`spd-hot` is a **small Python library** that holds the reusable ML logic for the
-HOT fAIr base model **YOLOv11m Swimming Pool Detection**.
+Python library for the HOT **swimming pool detector** on fAIr. It owns the model logic — preprocessing, ONNX decoding, georeferencing, GeoJSON output, and YOLO training helpers — so the fAIr model pack (`fAIr-models/models/yolo11m_swimming_pools/`) stays a thin STAC/ZenML/Docker adapter.
 
-It is designed to be imported by a thin `fAIr-models` contribution wrapper such as:
-- `fAIr_repos/fAIr-models/models/yolo11m_swimming_pools/pipeline.py`
+**Python:** ≥ 3.12
 
-That wrapper is responsible for the **fAIr contract** (ZenML steps/pipelines,
-STAC entrypoints, Docker stages, tests). `spd-hot` is responsible for the
-**model logic** (preprocess, ONNX decode, georeferencing, training dataset prep,
-Ultralytics train/eval/export helpers).
+---
 
-## What `spd-hot` is (and is not)
+## What it is
 
-- **Is**: a reusable implementation library (easy to unit-test without ZenML).
-- **Is**: parameterized via a single `params.py` module (defaults + parsing).
-- **Is not**: a ZenML pipeline package (no `@pipeline`, no `@step`).
-- **Is not**: a STAC package (no STAC JSON generation/validation).
-- **Is not**: tied to `fair` imports (so it stays portable).
+`spd_hot` is a reusable package, not a standalone service. It exposes typed helpers that fAIr (or local scripts) call for:
 
-`fAIr-models` remains the single source of truth for the base model contribution
-(`models/<name>/Dockerfile`, `stac-item.json`, step tests, etc.).
+| Area | Modules | Purpose |
+| --- | --- | --- |
+| **Inference** | `preprocess`, `decode`, `georef`, `postprocess`, `serve` | GeoTIFF chips → ONNX → EPSG:4326 GeoJSON |
+| **Training** | `dataset`, `geo_to_yolo_converter`, `train`, `evaluate`, `export` | GeoJSON + chips → YOLO fine-tune → metrics → ONNX bytes |
+| **Config** | `params` | Defaults and dict → dataclass parsing (STAC hyperparameters) |
 
-## Hyperparameters philosophy (STAC stays in control)
+Core dependencies are lightweight (`numpy`, `Pillow`, `pyproj`, `rasterio`). Ultralytics and ONNX are optional extras for training/export only — the inference image does not need them.
 
-fAIr controls hyperparameters through the STAC item (`mlm:hyperparameters` +
-`fair:hyperparameters_spec`). `spd-hot` must **not** block that.
+---
 
-The pattern we use is:
-- `spd_hot/params.py` defines **defaults** and **parsers** (dataclasses / helpers)
-- the caller (the `pipeline.py` wrapper) passes in `hyperparameters` / `params`
-- `spd-hot` merges `incoming params` over `defaults` and uses the result
+## Model
 
-So STAC overrides always win; defaults only apply when a key is missing.
+| Item | Value |
+| --- | --- |
+| Architecture | **YOLO11m** (Ultralytics) |
+| Base weights | [mozilla-ai/swimming-pool-detector](https://huggingface.co/mozilla-ai/swimming-pool-detector) on HuggingFace |
+| Classes | 1 — `swimming_pool` |
+| ONNX input | `(1, 3, 640, 640)` float32 NCHW, values in `[0, 1]` |
+| ONNX output | YOLO detection tensor `(1, 4+nc, anchors)` or transposed variant |
 
-## Recommended package layout (minimal + intuitive)
+Fine-tuned `.pt` weights are exported to ONNX via `export_onnx_bytes`. At serve time, fAIr loads the ONNX session and passes it to `predict_session`.
+
+---
+
+## Functionality overview
+
+### Inference path
 
 ```text
-spd-hot/
-  pyproject.toml
-  README.md
-  src/spd_hot/
-    __init__.py
-
-    params.py                 # one place for defaults + parsing (train/infer/pre/post)
-
-    preprocess.py             # GeoTIFF chip -> ONNX input tensor (+ meta for mapping back)
-    decode.py                 # YOLO ONNX output -> bboxes + scores (+ NMS)
-    postprocess.py            # detections -> GeoJSON FeatureCollection (EPSG:4326)
-    georef.py                 # pixel/CRS transforms, clipping to chip bounds, min-area filters
-    serve.py                  # predict_session(session, chips_dir, params) for fAIr serving
-
-    dataset.py                # label prep + splitting for finetune (no ZenML, no STAC)
-    train.py                  # ultralytics train wrapper (optional extra)
-    evaluate.py               # ultralytics val wrapper -> metrics dict
-    export.py                 # ultralytics export -> ONNX bytes + onnx.checker
-
-  tests/
-    test_preprocess.py
-    test_decode.py
-    test_georef.py
+GeoTIFF chip dir
+    │
+    ▼
+preprocess_chip_for_onnx()     RGB bands → resize 640×640 → normalize → (1,3,640,640)
+    │                          + PreprocessMeta (scale, transform, crs)
+    ▼
+onnxruntime session.run()      (provided by fAIr, not imported here)
+    │
+    ▼
+decode_yolo_onnx_output()      threshold + NMS → list of xyxy boxes + scores
+    │
+    ▼
+detections_to_feature_collection()  unscale → clip → EPSG:4326 polygons
+    │
+    ▼
+GeoJSON FeatureCollection
 ```
 
-### Why each file exists
+Entry point for fAIr: `spd_hot.serve.predict_session(session, input_images, params)`.
 
-- **`params.py`**: you asked for “one file” to define knobs. This holds:
-  - training params (epochs, batch_size, lr, val split, etc.)
-  - preprocess params (model input size, normalization, channel order)
-  - postprocess params (confidence threshold, IoU/NMS threshold, min area, etc.)
-  - inference params (a stable subset of postprocess + any runtime toggles)
+### Training path
 
-- **`preprocess.py`**: makes preprocessing explicit and shared across:
-  - training-time preprocessing (if you ever need it)
-  - ONNX serving (`fair.serve.base` passes chip paths)
+```text
+chips/ (GeoTIFF) + labels/ (one .geojson)
+    │
+    ▼
+prepare_yolo_detection_dataset_from_geojson()
+    │  spatial block split (train/val)
+    │  GeoJSON polygons → YOLO .txt labels (real writes)
+    │  chips symlinked (or copied) into images/{train,val}/
+    ▼
+train_yolo()                   Ultralytics fine-tune from base weights
+    │
+    ▼
+evaluate_yolo()                mAP, precision, recall → fAIr metric keys
+    │
+    ▼
+export_onnx_bytes()            validated ONNX file bytes for promotion
+```
 
-  Preprocess should:
-  - read RGB into **HWC** once (not per-channel)
-  - normalize to **float32 [0..1]**
-  - resize once to the model’s expected input (e.g. 640×640)
-  - output ONNX input tensor as **NCHW**: `(1, 3, 640, 640)`
-  - return **meta** needed for mapping outputs back (transform, crs, scale)
+---
 
-  **Do we georeference in preprocess?** No. Preprocess should *carry* the chip’s
-  `transform/crs` forward as metadata. Georeferencing happens when we convert
-  predicted pixel bboxes into EPSG:4326 geometries in postprocess.
+## Preprocess
 
-- **`decode.py`**: holds “YOLO ONNX output decoding” and NMS. Keeping it isolated:
-  - is required because fAIr serving calls `predict(session, ...)` with an
-    `onnxruntime.InferenceSession` (see `fAIr-models/docs/contributing/model.md`)
-  - avoids pulling the full Ultralytics+Torch stack into the distroless inference image
-  - keeps the unavoidable “ONNX raw outputs → detections” glue code small and testable
+`spd_hot.preprocess.preprocess_chip_for_onnx(path, cfg)` converts one chip to model input.
 
-  **Important design note**: this is not “reinventing Ultralytics”.
-  Ultralytics is still the right tool for **training** and **exporting** to ONNX.
-  At inference time inside fAIr, the model is executed via **onnxruntime** and returns
-  numpy arrays; something must translate those arrays into boxes and apply NMS unless
-  NMS is embedded in the exported ONNX graph.
+**Steps**
 
-  **Alternative (optional later)**: export ONNX with NMS embedded (if supported for
-  YOLOv11). If that route works reliably, `decode.py` can shrink dramatically, but it
-  tightens coupling to a specific export configuration and output tensor format.
+1. Open with `rasterio`, read bands 1/2/3 (RGB) as HWC uint8.
+2. Resize to `model_input_size` (default **640**) with Pillow bilinear — **no letterbox** (chips are square; resize is square → square).
+3. Normalize to float32 `[0, 1]` when `normalize_01=True`.
+4. Return tensor shape `(1, 3, S, S)` — **always NCHW**.
 
-- **`postprocess.py` + `georef.py`**: converts decoded detections into GeoJSON:
-  - rescale boxes from model-input pixel space back to chip pixel space
-  - clip to chip bounds
-  - optional min-area filtering
-  - transform from chip CRS to **EPSG:4326**
+**Metadata (`PreprocessMeta`)**
 
-- **`serve.py`**: model-specific serving *logic*, not the HTTP server.
-  The actual web server is `fair.serve.base` (Starlette app factory) which:
-  - downloads chips (via `geomltoolkits`)
-  - loads an `onnxruntime.InferenceSession`
-  - imports the model pipeline module and calls `predict(session, chips_dir, params)`
+| Field | Use |
+| --- | --- |
+| `width`, `height` | Original chip size (e.g. 256×256) |
+| `scale_x`, `scale_y` | Model pixels → chip pixels |
+| `transform`, `crs` | Chip pixels → map coordinates |
 
-  `spd-hot` still needs a clean place to hold the “predict over a directory of chips”
-  logic so `pipeline.py` stays tiny. `serve.py` is that place (typically exposing a
-  `predict_session(session, chips_dir, params)` function). It also enables:
-  - local unit tests without ZenML
-  - small scripts/CLIs to run inference on folders of chips
+Configurable via `PreprocessParams` / `parse_preprocess_params()`.
 
-- **`dataset.py`**: prepares finetune datasets *without* a COCO detour.
-  You explicitly said you don’t want the GeoJSON→COCO→YOLO path.
-  A simpler approach is:
-  - for each chip, intersect label polygons with chip bounds (clip)
-  - convert clipped polygons to pixel bboxes via rasterio transform
-  - write YOLO txt labels directly
+---
 
-  This is also the right place for **spatial splitting** (like `dinov3_hot.dataset.spatial_split`)
-  so the ZenML `split_dataset` step can stay tiny.
+## Postprocess
 
-- **`train.py` / `evaluate.py` / `export.py`**: small wrappers around Ultralytics:
-  - training returns a trained `.pt` (or bytes) for the ZenML artifact
-  - eval returns a **plain dict** with metric keys that the fAIr wrapper logs
-  - export returns **ONNX bytes** (never a path string)
+Postprocessing is split across decode (model space) and georef (map space).
 
-## Dependencies (what belongs in `spd-hot`)
+### Decode (`spd_hot.decode`)
 
-Keep `spd-hot` **inference-first** and add training deps as an extra.
+`decode_yolo_onnx_output(output, confidence_threshold, iou_threshold)`:
 
-- **Core (inference)**:
-  - `numpy`, `rasterio`, `pyproj`, `Pillow`
-  - (optional) `shapely` if you want robust clipping/geometry ops
+- Parses YOLO ONNX output (handles `(anchors, 4+nc)` layout).
+- Filters by confidence (default **0.25**).
+- Applies **NMS** in model pixel space (default IoU **0.45**).
+- Returns detections: `{x1, y1, x2, y2, confidence, class_id}`.
 
-  Notes:
-  - `numpy` is here because **onnxruntime returns numpy arrays**. Using numpy for
-    decode/postprocess is the lightest way to keep the inference image small.
-  - `onnxruntime` itself is already a dependency of `fair-py-ops`; `spd-hot` may
-    still depend on it for local (non-fAIr) inference utilities if desired.
+Pure NumPy — no Ultralytics at inference time.
 
-- **Training extra** (only installed in the training/batch image):
-  - `ultralytics` (brings torch), plus `onnx`, `onnxscript` for export/checks
+### Georef + GeoJSON (`spd_hot.postprocess` + `spd_hot.georef`)
 
-## About `geomltoolkits`
+`detections_to_feature_collection(detections, meta, cfg)`:
 
-`geomltoolkits` is a **geospatial utility** library used by `fair-py-ops[serve]`:
-- `fair.serve.base` uses it to download TMS imagery chips (georeferenced)
-- `fair dataset build` uses it to fetch OSM labels + imagery
+1. **Unscale** boxes from 640×640 back to original chip pixels (`unscale_from_model_space`).
+2. **Clip** to chip bounds (`clip_xyxy_to_image`).
+3. Drop boxes below `min_box_area_px` (default 0).
+4. Convert each bbox to an **EPSG:4326** polygon using the chip’s raster transform and CRS (`xyxy_to_epsg4326_polygon`).
+5. Emit a GeoJSON `FeatureCollection` with `confidence`, `class_id`, optional `source` (chip filename) and `class_name`.
 
-It does **not** provide an ONNX pipeline (no `onnxruntime` sessions / export helpers).
+Configurable via `PostprocessParams` / `InferenceParams` / `parse_inference_params()`.
 
-You may use `geomltoolkits` in a future “v2 footprints” workflow (mask→polygons via
-`vectorize_mask`, `orthogonalize`, `validate_polygon_geometries`), but for v1 YOLO
-detection labels and ONNX serving it’s not required.
+---
+
+## Parameters (defaults)
+
+Defined in `spd_hot.params`:
+
+| Dataclass | Key knobs | Defaults |
+| --- | --- | --- |
+| `PreprocessParams` | `model_input_size`, `chip_size_hint`, `normalize_01` | 640, 256, true |
+| `PostprocessParams` / `InferenceParams` | `confidence_threshold`, `iou_threshold`, `min_box_area_px` | 0.25, 0.45, 0.0 |
+| `SplitParams` | `val_ratio`, `split_seed`, `block_size` | 0.2, 42, 4 |
+| `TrainParams` | `epochs`, `batch_size`, `learning_rate`, `freeze_encoder`, `sample_fraction` | 10, 8, 0.01, true, 1.0 |
+
+fAIr passes plain dicts from STAC; use the `parse_*` helpers to get typed configs. Defaults apply when keys are missing — STAC can override any value.
+
+`freeze_encoder=True` maps to Ultralytics `freeze=10` (first 10 layers frozen).
+
+---
+
+## Package layout
+
+```text
+src/spd_hot/
+  params.py                 # defaults + parsing
+  preprocess.py             # chip → NCHW tensor + PreprocessMeta
+  decode.py                 # ONNX output → detections + NMS
+  georef.py                 # chip pixels → EPSG:4326 (inference)
+  postprocess.py            # detections → GeoJSON
+  serve.py                  # predict_session() — fAIr predict entry
+  dataset.py                # GeoJSON + chips → YOLO dataset tree
+  geo_to_yolo_converter.py  # polygon → YOLO txt (training)
+  train.py                  # Ultralytics train wrapper
+  evaluate.py               # validation metrics
+  export.py                 # ONNX export bytes
+tests/
+  test_preprocess.py
+  test_decode.py
+  test_georef.py
+  test_dataset_yolo.py
+```
+
+---
+
+## Install (uv)
+
+From `cd fair_models/swimming_pool/spd-hot
+`:
+
+```bash
+# Create and activate a virtualenv
+uv venv
+source .venv/bin/activate          # Linux / macOS / WSL
+# .venv\Scripts\activate           # Windows PowerShell
+
+# Core + tests (inference helpers, pytest, shapely)
+uv pip install -e ".[test]"
+
+# Add training/export (ultralytics, onnx)
+uv pip install -e ".[train,test]"
+```
+
+Run commands inside the venv without activating:
+
+```bash
+uv run pytest -q
+uv run python -c "from spd_hot import predict_session; print(predict_session)"
+```
+
+Alternative without uv:
+
+```bash
+python -m venv .venv
+.venv\Scripts\python -m pip install -U pip
+.venv\Scripts\python -m pip install -e ".[test]"
+```
+
+---
+
+## Testing
+
+```bash
+uv run pytest -q
+# or
+python -m pytest -q
+```
+
+| Test file | What it checks |
+| --- | --- |
+| `test_preprocess.py` | Output shape `(1,3,S,S)`, float32, values in `[0,1]`, meta width/height |
+| `test_decode.py` | Minimal YOLO-like tensor decodes to one detection after NMS |
+| `test_georef.py` | Bbox clipping and coordinate mapping |
+| `test_dataset_yolo.py` | GeoJSON + chips → YOLO `data.yaml`, `.txt` labels, train/val split |
+
+Tests use synthetic GeoTIFFs and in-memory arrays — no real ONNX file or HuggingFace download required.
+
+**Suggested layers**
+
+1. **Unit** (above) — preprocess, decode, georef, dataset in isolation.
+2. **Contract** — fake `session.run()` returning a fixed tensor; assert `predict_session` GeoJSON shape and properties.
+3. **Integration** (optional) — real ONNX + `onnxruntime` + sample chip.
+
+---
+
+## fAIr integration (thin adapter)
+
+In `fAIr-models/models/yolo11m_swimming_pools/pipeline.py`, inference delegates to this library:
+
+```python
+from spd_hot.serve import predict_session
+
+def predict(session, input_images, params):
+    return predict_session(session, input_images, params)
+```
+
+Same pattern as `dinov3s_buildings` → `dinov3_hot.serve.predict_session`. fAIr owns STAC, ZenML steps, Docker stages, and ONNX session loading; `spd-hot` owns everything after the session is ready.
+
+Training steps resolve remote chips/labels locally, call `prepare_yolo_detection_dataset_from_geojson`, then `train_yolo` / `evaluate_yolo` / `export_onnx_bytes`.
+
+---
+
+## Public API
+
+Re-exported from `spd_hot`:
+
+`predict_session`, `preprocess_chip_for_onnx`, `decode_yolo_onnx_output`, `detections_to_feature_collection`, `spatial_split`, `train_yolo`, `evaluate_yolo`, `export_onnx_bytes`, and parameter dataclasses / parsers.
+
+Dataset preparation is imported from `spd_hot.dataset` (`prepare_yolo_detection_dataset_from_geojson`).

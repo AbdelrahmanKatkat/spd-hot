@@ -35,6 +35,26 @@ def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> lis
     return keep
 
 
+def _is_yolo_feature_dim(size: int) -> bool:
+    """True when a matrix axis likely holds `(cx, cy, w, h, class_scores...)`."""
+    return 5 <= size <= 256
+
+
+def _to_anchors_by_features(preds: np.ndarray) -> np.ndarray:
+    """Normalize YOLO ONNX layouts to `(num_anchors, 4 + num_classes)`."""
+    rows, cols = preds.shape
+    rows_are_features = _is_yolo_feature_dim(rows)
+    cols_are_features = _is_yolo_feature_dim(cols)
+
+    if rows_are_features and not cols_are_features:
+        return preds.transpose(1, 0)
+    if cols_are_features and not rows_are_features:
+        return preds
+    if rows < cols:
+        return preds.transpose(1, 0)
+    return preds
+
+
 def decode_yolo_onnx_output(
     output: Any,
     confidence_threshold: float,
@@ -45,9 +65,7 @@ def decode_yolo_onnx_output(
     if preds.ndim != 2:
         raise ValueError(f"Unexpected YOLO output shape after squeeze: {preds.shape}")
 
-    # Convert to (anchors, 4+nc)
-    if preds.shape[0] < preds.shape[1]:
-        preds = preds.transpose(1, 0)
+    preds = _to_anchors_by_features(preds)
 
     boxes_cxcywh = preds[:, :4]
     class_scores = preds[:, 4:]

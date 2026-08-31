@@ -23,7 +23,7 @@ def test_preprocess_outputs_nchw_float32(tmp_path):
     ) as dst:
         dst.write(arr)
 
-    batch, meta = preprocess_chip_for_onnx(path, PreprocessParams(model_input_size=64, letterbox=True))
+    batch, meta = preprocess_chip_for_onnx(path, PreprocessParams(model_input_size=64))
     assert batch.shape == (1, 3, 64, 64)
     assert batch.dtype == np.float32
     assert 0.0 <= float(batch.min()) <= 1.0
