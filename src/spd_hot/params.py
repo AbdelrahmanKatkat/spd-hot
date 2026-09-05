@@ -31,6 +31,8 @@ class TrainParams:
     sample_fraction: float = 1.0
     # Must match ONNX export and preprocess resize (fAIr key: chip_size).
     imgsz: int = 640
+    # Ultralytics device: "0" / "cuda" when a GPU is visible, otherwise "cpu".
+    device: str = "cpu"
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,7 @@ def parse_train_params(hyperparameters: Mapping[str, Any] | None) -> TrainParams
         freeze_encoder=_as_bool(_get(hp, "freeze_encoder", TrainParams.freeze_encoder)),
         sample_fraction=_as_float(_get(hp, "sample_fraction", TrainParams.sample_fraction)),
         imgsz=_as_int(_get(hp, "chip_size", _get(hp, "imgsz", TrainParams.imgsz))),
+        device=str(_get(hp, "device", TrainParams.device)),
     )
 
 

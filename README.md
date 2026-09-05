@@ -142,7 +142,7 @@ Defined in `spd_hot.params`:
 | `PreprocessParams` | `model_input_size`, `chip_size_hint`, `normalize_01` | 640, 256, true |
 | `PostprocessParams` / `InferenceParams` | `confidence_threshold`, `iou_threshold`, `min_box_area_px` | 0.25, 0.45, 0.0 |
 | `SplitParams` | `val_ratio`, `split_seed`, `block_size` | 0.2, 42, 4 |
-| `TrainParams` | `epochs`, `batch_size`, `learning_rate`, `freeze_encoder`, `sample_fraction` | 10, 8, 0.01, true, 1.0 |
+| `TrainParams` | `epochs`, `batch_size`, `learning_rate`, `freeze_encoder`, `sample_fraction`, `device` | 10, 8, 0.01, true, 1.0, `cpu` |
 
 fAIr passes plain dicts from STAC; use the `parse_*` helpers to get typed configs. Defaults apply when keys are missing — STAC can override any value.
 

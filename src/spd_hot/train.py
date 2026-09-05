@@ -25,6 +25,7 @@ def train_yolo(
         lr0=cfg.learning_rate,
         freeze=10 if cfg.freeze_encoder else 0,
         imgsz=cfg.imgsz,
+        device=cfg.device,
         project=str(project_dir),
         name=run_name,
     )
