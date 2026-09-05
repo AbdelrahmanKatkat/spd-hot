@@ -29,6 +29,8 @@ class TrainParams:
     freeze_encoder: bool = True
     # Optional fractional subsampling for smoke tests and CI.
     sample_fraction: float = 1.0
+    # Must match ONNX export and preprocess resize (fAIr key: chip_size).
+    imgsz: int = 640
 
 
 @dataclass(frozen=True)
@@ -114,13 +116,17 @@ def parse_train_params(hyperparameters: Mapping[str, Any] | None) -> TrainParams
         learning_rate=_as_float(_get(hp, "learning_rate", TrainParams.learning_rate)),
         freeze_encoder=_as_bool(_get(hp, "freeze_encoder", TrainParams.freeze_encoder)),
         sample_fraction=_as_float(_get(hp, "sample_fraction", TrainParams.sample_fraction)),
+        imgsz=_as_int(_get(hp, "chip_size", _get(hp, "imgsz", TrainParams.imgsz))),
     )
 
 
 def parse_preprocess_params(hyperparameters: Mapping[str, Any] | None) -> PreprocessParams:
     hp = hyperparameters or {}
+    size = _get(hp, "model_input_size", None)
+    if size is None:
+        size = _get(hp, "chip_size", PreprocessParams.model_input_size)
     return PreprocessParams(
-        model_input_size=_as_int(_get(hp, "model_input_size", PreprocessParams.model_input_size)),
+        model_input_size=_as_int(size),
         chip_size_hint=_as_int(_get(hp, "chip_size", PreprocessParams.chip_size_hint)),
         normalize_01=_as_bool(_get(hp, "normalize_01", PreprocessParams.normalize_01)),
     )

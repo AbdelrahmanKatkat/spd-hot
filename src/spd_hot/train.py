@@ -24,6 +24,7 @@ def train_yolo(
         batch=cfg.batch_size,
         lr0=cfg.learning_rate,
         freeze=10 if cfg.freeze_encoder else 0,
+        imgsz=cfg.imgsz,
         project=str(project_dir),
         name=run_name,
     )

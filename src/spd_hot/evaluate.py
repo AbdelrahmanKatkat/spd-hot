@@ -3,9 +3,9 @@
 from typing import Any
 
 
-def evaluate_yolo(model: Any, data_yaml_path: str) -> dict[str, float]:
+def evaluate_yolo(model: Any, data_yaml_path: str, *, imgsz: int = 640) -> dict[str, float]:
     """Run validation and return fAIr-friendly metric keys."""
-    metrics = model.val(data=data_yaml_path)
+    metrics = model.val(data=data_yaml_path, imgsz=imgsz)
     # Ultralytics exposes metric values as attributes on `metrics.box`.
     box = metrics.box
     return {
