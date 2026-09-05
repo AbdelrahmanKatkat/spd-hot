@@ -1,10 +1,28 @@
-"""Postprocessing from decoded detections to GeoJSON features."""
+"""Postprocessing: ONNX tensor → detections, then detections → GeoJSON."""
 
-from typing import Any
+from typing import Any, Mapping
 
+from .decode import decode_yolo_onnx_output
 from .georef import area_xyxy, clip_xyxy_to_image, unscale_from_model_space, xyxy_to_epsg4326_polygon
-from .params import PostprocessParams
+from .params import PostprocessParams, parse_postprocess_params
 from .preprocess import PreprocessMeta
+
+
+def postprocess_onnx_output(
+    raw_output: Any,
+    params: Mapping[str, Any] | None = None,
+) -> list[dict[str, float | int]]:
+    """Decode a YOLO ONNX tensor into detections (confidence filter + NMS).
+
+    This is the STAC-facing postprocess step: it does not georeference.
+    Map-space conversion is `detections_to_feature_collection`.
+    """
+    cfg = parse_postprocess_params(params)
+    return decode_yolo_onnx_output(
+        raw_output,
+        confidence_threshold=cfg.confidence_threshold,
+        iou_threshold=cfg.iou_threshold,
+    )
 
 
 def detections_to_feature_collection(
