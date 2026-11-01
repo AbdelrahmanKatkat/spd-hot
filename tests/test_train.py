@@ -1,7 +1,38 @@
 import math
+import sys
 from types import SimpleNamespace
 
-from spd_hot.train import _epoch_losses, _epoch_report
+from spd_hot.params import PreprocessParams, TrainParams
+from spd_hot.train import _epoch_losses, _epoch_report, train
+
+
+def test_train_hands_the_optimizer_and_learning_rate_to_ultralytics(monkeypatch, tmp_path):
+    calls = {}
+
+    class FakeYOLO:
+        def __init__(self, weights):
+            calls["weights"] = weights
+
+        def add_callback(self, *_args):
+            pass
+
+        def train(self, **kwargs):
+            calls["train"] = kwargs
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=FakeYOLO))
+    monkeypatch.setattr("spd_hot.train._resolve_device", lambda requested: "cpu")
+    train(
+        weights="base.pt",
+        dataset_yaml=tmp_path / "data.yaml",
+        cfg=TrainParams(learning_rate=0.003),
+        pre=PreprocessParams(),
+        project_dir=tmp_path,
+    )
+
+    # An explicit optimizer keeps lr0: Ultralytics' `auto` would ignore it.
+    assert calls["train"]["optimizer"] == "AdamW"
+    assert calls["train"]["lr0"] == 0.003
+    assert calls["train"]["imgsz"] == 512
 
 
 def test_the_epoch_losses_come_from_the_trainer_dicts():

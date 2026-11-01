@@ -18,6 +18,14 @@ def test_none_and_missing_keys_give_the_defaults():
     assert (train.epochs, train.freeze_encoder, train.device) == (10, True, "auto")
 
 
+def test_the_optimizer_is_explicit_and_auto_is_refused():
+    assert parse_train_params(None).optimizer == "AdamW"
+    assert parse_train_params({"optimizer": "SGD"}).optimizer == "SGD"
+    # Ultralytics' `auto` ignores the learning rate, so it is refused instead of silently dropping it.
+    with pytest.raises(ValueError, match="auto"):
+        parse_train_params({"optimizer": "auto"})
+
+
 def test_aliases_are_read_and_canonical_names_win():
     assert parse_postprocess_params({"score_thresh": 0.4}).confidence_threshold == 0.4
     assert parse_postprocess_params({"iou_threshold": 0.3}).nms_threshold == 0.3

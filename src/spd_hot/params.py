@@ -56,11 +56,16 @@ class PostprocessParams:
 
 @dataclass(frozen=True)
 class TrainParams:
-    """Ultralytics fine-tuning knobs. `freeze_encoder` freezes the YOLO11 backbone, so the neck and the head adapt."""
+    """Ultralytics fine-tuning knobs. `freeze_encoder` freezes the YOLO11 backbone, so the neck and the head adapt.
+
+    The optimizer is explicit, AdamW as in Mozilla's training: with Ultralytics' own `auto` choice `learning_rate` is
+    ignored and a learning rate is picked from the dataset size.
+    """
 
     epochs: int = 10
     batch_size: int = 8
     learning_rate: float = 0.01
+    optimizer: str = "AdamW"
     freeze_encoder: bool = True
     device: str = "auto"  # cuda if visible, else cpu (training is meant to run on a GPU)
 
@@ -167,10 +172,17 @@ def parse_train_params(params: Mapping[str, Any] | None) -> TrainParams:
         raise ValueError(f"epochs and batch_size must be >= 1, got {epochs} and {batch_size}")
     if not math.isfinite(learning_rate) or learning_rate <= 0:
         raise ValueError(f"learning_rate must be a positive number, got {learning_rate}")
+    optimizer = str(_get(given, ("optimizer",), TrainParams.optimizer)).strip()
+    if not optimizer or optimizer.lower() == "auto":
+        raise ValueError(
+            f"optimizer must be a named optimizer such as AdamW or SGD, got {optimizer!r}: "
+            "'auto' ignores learning_rate"
+        )
     return TrainParams(
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        optimizer=optimizer,
         freeze_encoder=_as_bool(
             _get(given, ("freeze_encoder", "freeze_backbone"), TrainParams.freeze_encoder)
         ),

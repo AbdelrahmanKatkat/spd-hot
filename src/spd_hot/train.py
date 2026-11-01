@@ -101,11 +101,13 @@ def train(
     model = YOLO(str(weights))
     model.add_callback("on_fit_epoch_end", _epoch_report(cfg.epochs, on_epoch_end))
     log.info(
-        "training start: weights=%s data=%s epochs=%d batch=%d imgsz=%d device=%s",
+        "training start: weights=%s data=%s epochs=%d batch=%d optimizer=%s lr=%g imgsz=%d device=%s",
         weights,
         dataset_yaml,
         cfg.epochs,
         cfg.batch_size,
+        cfg.optimizer,
+        cfg.learning_rate,
         pre.model_input_size,
         device,
     )
@@ -113,6 +115,7 @@ def train(
         data=str(dataset_yaml),
         epochs=cfg.epochs,
         batch=cfg.batch_size,
+        optimizer=cfg.optimizer,
         lr0=cfg.learning_rate,
         freeze=FROZEN_LAYERS if cfg.freeze_encoder else 0,
         imgsz=pre.model_input_size,
