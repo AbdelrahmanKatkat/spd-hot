@@ -1068,6 +1068,22 @@ wheels = [
 ]
 
 [[package]]
+name = "onnxslim"
+version = "0.1.98"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama" },
+    { name = "ml-dtypes" },
+    { name = "onnx" },
+    { name = "packaging" },
+    { name = "sympy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/55/91/956b6e2ab4a10f274af9766dbafa616623c72bb4ee6226ed9de5f9253ab4/onnxslim-0.1.98.tar.gz", hash = "sha256:f9160f1a325de623409a4fd0b3b876124ad1c604b1ebdd4ed81f25b888e42ff4", size = 611126, upload-time = "2026-10-08T05:42:21.373Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ea/7e/756d2b76d16df71282021260b0f6a8aebb91a23a10bce1a25cf79e81bf50/onnxslim-0.1.98-py3-none-any.whl", hash = "sha256:25383fcd43c471e3cabeb774b5cdbf3e36a1b3fd283c7ebbdcdf5aa6731dcee3", size = 245766, upload-time = "2026-10-08T05:42:19.981Z" },
+]
+
+[[package]]
 name = "opencv-python"
 version = "5.0.0.93"
 source = { registry = "https://pypi.org/simple" }
@@ -1497,6 +1513,8 @@ test = [
 ]
 train = [
     { name = "onnx" },
+    { name = "onnxruntime" },
+    { name = "onnxslim" },
     { name = "ultralytics" },
 ]
 
@@ -1505,6 +1523,8 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "onnx", marker = "extra == 'train'", specifier = ">=1.17" },
     { name = "onnxruntime", marker = "extra == 'infer'", specifier = ">=1.18" },
+    { name = "onnxruntime", marker = "extra == 'train'", specifier = ">=1.20" },
+    { name = "onnxslim", marker = "extra == 'train'", specifier = ">=0.1.82" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pyproj", specifier = ">=3.6" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },

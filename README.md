@@ -47,13 +47,13 @@ and `scripts/report_chip_scale.py` prints it for a folder.
 | Extra | Contents | Who installs it |
 |---|---|---|
 | *(none)* | numpy, Pillow, pyproj, rasterio. **No torch.** | the CPU inference image (plus `onnxruntime`, which the fAIr serving base provides) |
-| `train` | ultralytics (brings torch), onnx: fine-tuning, evaluation, ONNX export | the fAIr **GPU** training image |
+| `train` | ultralytics (brings torch), onnx, onnxslim, onnxruntime: fine-tuning, evaluation, ONNX export | the fAIr **GPU** training image |
 | `infer` | onnxruntime | running an exported ONNX locally (`scripts/predict.py`, `scripts/evaluate.py`) |
 | `test` | pytest | CI |
 
 Training runs on a GPU, but the CUDA build of torch is chosen by the image (a CUDA wheel index), not by this package's
-metadata. The ONNX export through Ultralytics also wants `onnxslim` and `onnxruntime`; if they are missing Ultralytics
-installs them itself during the export, so install them in the training image instead of letting it do so at run time.
+metadata. `onnxslim` and `onnxruntime` are in the `train` extra because Ultralytics' ONNX export needs them; without
+them it would install both itself while exporting.
 
 ```bash
 uv sync                                # inference core

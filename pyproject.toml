@@ -22,6 +22,10 @@ dependencies = [
 # torch is chosen by the image (a CUDA wheel index), not by this metadata; Ultralytics brings torch itself.
 train = [
     "onnx>=1.17",
+    # Needed at export time: Ultralytics' ONNX export simplifies the graph with onnxslim and loads it with
+    # onnxruntime; without them it installs both itself while exporting. Versions are Ultralytics' own minimums.
+    "onnxslim>=0.1.82",
+    "onnxruntime>=1.20",
     "ultralytics>=8.4.0",
 ]
 # Run an exported ONNX locally (`scripts/evaluate.py`, `scripts/predict.py`). The fAIr serving base brings its own onnxruntime.
