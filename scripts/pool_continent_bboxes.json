@@ -1,0 +1,32 @@
+[
+  {
+    "name": "Africa",
+    "region": "Africa",
+    "bbox": [-18.0, -35.0, 52.0, 38.0]
+  },
+  {
+    "name": "Europe",
+    "region": "Europe",
+    "bbox": [-10.0, 35.0, 40.0, 71.0]
+  },
+  {
+    "name": "Asia",
+    "region": "Asia",
+    "bbox": [60.0, -10.0, 150.0, 50.0]
+  },
+  {
+    "name": "North America",
+    "region": "North America",
+    "bbox": [-125.0, 7.0, -60.0, 50.0]
+  },
+  {
+    "name": "South America",
+    "region": "South America",
+    "bbox": [-82.0, -56.0, -34.0, 13.0]
+  },
+  {
+    "name": "Oceania",
+    "region": "Oceania",
+    "bbox": [110.0, -48.0, 180.0, -10.0]
+  }
+]

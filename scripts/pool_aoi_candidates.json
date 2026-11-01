@@ -1,0 +1,32 @@
+[
+  {
+    "name": "Nairobi, Kenya",
+    "region": "Africa",
+    "bbox": [36.60, -1.47, 37.00, -1.07]
+  },
+  {
+    "name": "Manila, Philippines",
+    "region": "Asia",
+    "bbox": [120.80, 14.36, 121.20, 14.76]
+  },
+  {
+    "name": "Bogota, Colombia",
+    "region": "South America",
+    "bbox": [-74.27, 4.45, -73.87, 4.85]
+  },
+  {
+    "name": "Mexico City, Mexico",
+    "region": "North America",
+    "bbox": [-99.33, 19.23, -98.93, 19.63]
+  },
+  {
+    "name": "Brisbane, Australia",
+    "region": "Oceania",
+    "bbox": [152.82, -27.67, 153.22, -27.27]
+  },
+  {
+    "name": "Madrid, Spain",
+    "region": "Europe",
+    "bbox": [-3.90, 40.22, -3.50, 40.62]
+  }
+]

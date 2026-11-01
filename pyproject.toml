@@ -4,10 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "spd-hot"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reusable swimming-pool detector helpers for HOT fAIr model onboarding."
 readme = "README.md"
 requires-python = ">=3.12"
+# Inference core only (the CPU serving image installs this plus onnxruntime, which the fAIr serving base provides):
+# numpy and Pillow for preprocessing, rasterio and pyproj for georeferencing. No torch, no shapely.
 dependencies = [
     "numpy>=1.26",
     "Pillow>=10.0",
@@ -16,16 +18,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# What the fAIr training image installs: fine-tuning and ONNX export. Training runs on a GPU, but the CUDA build of
+# torch is chosen by the image (a CUDA wheel index), not by this metadata; Ultralytics brings torch itself.
 train = [
     "onnx>=1.17",
-    "onnxscript>=0.1",
-    "shapely>=2.0",
     "ultralytics>=8.4.0",
+]
+# Run an exported ONNX locally (`scripts/evaluate.py`, `scripts/predict.py`). The fAIr serving base brings its own onnxruntime.
+infer = [
+    "onnxruntime>=1.18",
 ]
 test = [
     "pytest>=8.0",
-    "shapely>=2.0",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spd_hot"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110

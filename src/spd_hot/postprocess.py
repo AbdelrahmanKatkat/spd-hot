@@ -1,69 +1,40 @@
-"""Postprocessing: ONNX tensor → detections, then detections → GeoJSON."""
+"""Chip-pixel detections -> GeoJSON FeatureCollection."""
 
-from typing import Any, Mapping
+from typing import Any
 
-from .decode import decode_yolo_onnx_output
-from .georef import area_xyxy, clip_xyxy_to_image, unscale_from_model_space, xyxy_to_epsg4326_polygon
-from .params import PostprocessParams, parse_postprocess_params
+from .georef import clip_xyxy_to_image, xyxy_to_epsg4326_polygon
 from .preprocess import PreprocessMeta
 
-
-def postprocess_onnx_output(
-    raw_output: Any,
-    params: Mapping[str, Any] | None = None,
-) -> list[dict[str, float | int]]:
-    """Decode a YOLO ONNX tensor into detections (confidence filter + NMS).
-
-    This is the STAC-facing postprocess step: it does not georeference.
-    Map-space conversion is `detections_to_feature_collection`.
-    """
-    cfg = parse_postprocess_params(params)
-    return decode_yolo_onnx_output(
-        raw_output,
-        confidence_threshold=cfg.confidence_threshold,
-        iou_threshold=cfg.iou_threshold,
-    )
+CLASS_NAMES = {0: "swimming_pool"}  # the single class of the YOLO11 pack model
 
 
 def detections_to_feature_collection(
     detections: list[dict[str, float | int]],
     meta: PreprocessMeta,
-    cfg: PostprocessParams,
     *,
     source_name: str | None = None,
-    class_name: str | None = None,
 ) -> dict[str, Any]:
-    """Convert decoded detection dicts into a GeoJSON FeatureCollection."""
+    """`detections` are in source-chip pixels; output is EPSG:4326 box polygons."""
     features: list[dict[str, Any]] = []
     for det in detections:
-        x1, y1, x2, y2 = unscale_from_model_space(
-            float(det["x1"]),
-            float(det["y1"]),
-            float(det["x2"]),
-            float(det["y2"]),
-            meta,
+        x1, y1, x2, y2 = clip_xyxy_to_image(
+            det["x1"], det["y1"], det["x2"], det["y2"], meta.width, meta.height
         )
-        x1, y1, x2, y2 = clip_xyxy_to_image(x1, y1, x2, y2, meta.width, meta.height)
-        if area_xyxy(x1, y1, x2, y2) < cfg.min_box_area_px:
+        if x2 <= x1 or y2 <= y1:
             continue
-
-        polygon = xyxy_to_epsg4326_polygon(x1, y1, x2, y2, meta.transform, meta.crs)
-        props: dict[str, Any] = {
+        ring = xyxy_to_epsg4326_polygon(x1, y1, x2, y2, meta.transform, meta.crs)
+        properties: dict[str, Any] = {
             "confidence": round(float(det["confidence"]), 4),
             "class_id": int(det["class_id"]),
+            "class_name": CLASS_NAMES.get(int(det["class_id"]), "swimming_pool"),
         }
-        if class_name:
-            props["class_name"] = class_name
         if source_name:
-            props["source"] = source_name
-
+            properties["source"] = source_name
         features.append(
             {
                 "type": "Feature",
-                "properties": props,
-                "geometry": {"type": "Polygon", "coordinates": [polygon]},
+                "properties": properties,
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
             }
         )
-
     return {"type": "FeatureCollection", "features": features}
-

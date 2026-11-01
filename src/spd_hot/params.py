@@ -1,156 +1,173 @@
-"""Centralised parameters for `spd-hot` (defaults + parsing).
+"""Constants, defaults and dict -> dataclass parsing for `spd-hot`.
 
-Design goals:
-- Single place to define knobs (training / preprocess / inference / postprocess).
-- Defaults only; never block STAC from overriding values.
-- Accepts plain dicts (from fAIr `pipeline.py`) and returns typed dataclasses.
+Parsers tolerate `None` and missing keys. The first present key wins: the canonical name, then its aliases.
+
+Where each value lives (the level-2 ONNX contract):
+- inside the ONNX graph: the backbone, neck and head, anchors and box decoding. Fixed by the exported model: input
+  `images` (1, 3, 512, 512) float32, output `output0` (1, 4 + nc, anchors). There is NO normalisation in the graph (its
+  first node is a convolution, checked on the exported file): the input must already be RGB in [0, 1]. Ultralytics
+  applies no mean or std, only the division by 255.
+- outside, tunable: the chip resize and the division by 255 (`preprocess.py`, `PreprocessParams`), the confidence
+  filter and NMS (`PostprocessParams`).
 """
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
+
+# --- model constants (fixed by the exported graph) ---
+# The base model (mozilla-ai/swimming-pool-detector) was trained at `imgsz=512` on 512 x 512 px images, each one Mapbox
+# satellite tile at zoom 18: 40075016.686 * cos(lat) / 2**18 / 512 = 0.2986 * cos(lat) m per pixel. A 256 px chip of the
+# same zoom-18 tile (0.597 * cos(lat) m per pixel) resized to 512 therefore has the training scale; other zooms do not.
+MODEL_INPUT_SIZE = (
+    512  # the ONNX input is fixed at 512 x 512; a size must be a multiple of the YOLO stride (32)
+)
+MAX_DETECTIONS = 300  # per chip after NMS (Ultralytics' `max_det` default)
+FROZEN_LAYERS = 10  # Ultralytics `freeze` when the encoder is frozen: the YOLO11 backbone, layers 0 to 9
 
 
 @dataclass(frozen=True)
 class SplitParams:
-    """Train/val split controls (used by dataset preparation)."""
-
     val_ratio: float = 0.2
     split_seed: int = 42
     block_size: int = 4
 
 
 @dataclass(frozen=True)
+class PreprocessParams:
+    """How a chip is resized before the model. Training and serving must use the same value."""
+
+    model_input_size: int = MODEL_INPUT_SIZE
+
+
+@dataclass(frozen=True)
+class PostprocessParams:
+    """Thresholds applied outside the ONNX graph (which returns every anchor)."""
+
+    confidence_threshold: float = 0.25
+    nms_threshold: float = 0.45  # Ultralytics' `iou`, per class, within a chip
+
+
+@dataclass(frozen=True)
 class TrainParams:
-    """Ultralytics training parameters (a conservative subset)."""
+    """Ultralytics fine-tuning knobs. `freeze_encoder` freezes the YOLO11 backbone, so the neck and the head adapt."""
 
     epochs: int = 10
     batch_size: int = 8
     learning_rate: float = 0.01
     freeze_encoder: bool = True
-    # Optional fractional subsampling for smoke tests and CI.
-    sample_fraction: float = 1.0
-    # Must match ONNX export and preprocess resize (fAIr key: chip_size).
-    imgsz: int = 640
-    # Ultralytics device: "0" / "cuda" when a GPU is visible, otherwise "cpu".
-    device: str = "cpu"
+    device: str = "auto"  # cuda if visible, else cpu (training is meant to run on a GPU)
 
 
-@dataclass(frozen=True)
-class PreprocessParams:
-    """Controls how chips are converted to model inputs."""
-
-    # The model’s expected input size (e.g. 640 for YOLO11).
-    model_input_size: int = 640
-    # Chips coming from fAIr are usually 256×256, but allow any size.
-    chip_size_hint: int = 256
-
-    # Normalization: uint8 [0..255] -> float32 [0..1]
-    normalize_01: bool = True
+def _get(mapping: Mapping[str, Any], keys: tuple[str, ...], default: Any) -> Any:
+    """First present non-None key wins (canonical key first, then aliases)."""
+    for key in keys:
+        if mapping.get(key) is not None:
+            return mapping[key]
+    return default
 
 
-@dataclass(frozen=True)
-class PostprocessParams:
-    """Controls how raw model outputs become final geospatial features."""
-
-    confidence_threshold: float = 0.25
-    iou_threshold: float = 0.45
-
-    # Filtering in chip pixel space before georeferencing.
-    min_box_area_px: float = 0.0
+def _as_int(value: Any) -> int:
+    if isinstance(value, bool):
+        raise TypeError("bool is not a valid int here")
+    return int(value)
 
 
-@dataclass(frozen=True)
-class InferenceParams:
-    """The params surface intended for fAIr inference requests.
-
-    This should remain stable; training-only knobs belong in TrainParams.
-    """
-
-    confidence_threshold: float = 0.25
-    iou_threshold: float = 0.45
-    min_box_area_px: float = 0.0
+def _as_float(value: Any) -> float:
+    if isinstance(value, bool):
+        raise TypeError("bool is not a valid float here")
+    return float(value)
 
 
-def _get(d: Mapping[str, Any], key: str, default: Any) -> Any:
-    return d[key] if key in d and d[key] is not None else default
-
-
-def _as_bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return bool(v)
-    if isinstance(v, str):
-        raw = v.strip().lower()
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
         if raw in {"1", "true", "yes", "y", "on"}:
             return True
         if raw in {"0", "false", "no", "n", "off"}:
             return False
-    raise ValueError(f"Expected bool-like value, got {v!r}")
+    raise ValueError(f"Expected bool-like value, got {value!r}")
 
 
-def _as_int(v: Any) -> int:
-    if isinstance(v, bool):
-        raise ValueError("bool is not a valid int here")
-    return int(v)
-
-
-def _as_float(v: Any) -> float:
-    if isinstance(v, bool):
-        raise ValueError("bool is not a valid float here")
-    return float(v)
+def _check_unit(name: str, value: float, *, low_open: bool = False) -> float:
+    ok = (0.0 < value <= 1.0) if low_open else (0.0 <= value <= 1.0)
+    if not ok:
+        raise ValueError(f"{name} must be in {'(0, 1]' if low_open else '[0, 1]'}, got {value}")
+    return value
 
 
 def parse_split_params(hyperparameters: Mapping[str, Any] | None) -> SplitParams:
-    hp = hyperparameters or {}
+    given = hyperparameters or {}
+    val_ratio = _as_float(_get(given, ("val_ratio",), SplitParams.val_ratio))
+    block_size = _as_int(_get(given, ("block_size",), SplitParams.block_size))
+    if not 0 < val_ratio < 1:  # both sides need chips
+        raise ValueError(f"val_ratio must be in (0, 1), got {val_ratio}")
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
     return SplitParams(
-        val_ratio=_as_float(_get(hp, "val_ratio", SplitParams.val_ratio)),
-        split_seed=_as_int(_get(hp, "split_seed", SplitParams.split_seed)),
-        block_size=_as_int(_get(hp, "block_size", SplitParams.block_size)),
+        val_ratio=val_ratio,
+        split_seed=_as_int(_get(given, ("split_seed",), SplitParams.split_seed)),
+        block_size=block_size,
     )
 
 
-def parse_train_params(hyperparameters: Mapping[str, Any] | None) -> TrainParams:
-    hp = hyperparameters or {}
-    return TrainParams(
-        epochs=_as_int(_get(hp, "epochs", TrainParams.epochs)),
-        batch_size=_as_int(_get(hp, "batch_size", TrainParams.batch_size)),
-        learning_rate=_as_float(_get(hp, "learning_rate", TrainParams.learning_rate)),
-        freeze_encoder=_as_bool(_get(hp, "freeze_encoder", TrainParams.freeze_encoder)),
-        sample_fraction=_as_float(_get(hp, "sample_fraction", TrainParams.sample_fraction)),
-        imgsz=_as_int(_get(hp, "chip_size", _get(hp, "imgsz", TrainParams.imgsz))),
-        device=str(_get(hp, "device", TrainParams.device)),
-    )
-
-
-def parse_preprocess_params(hyperparameters: Mapping[str, Any] | None) -> PreprocessParams:
-    hp = hyperparameters or {}
-    size = _get(hp, "model_input_size", None)
-    if size is None:
-        size = _get(hp, "chip_size", PreprocessParams.model_input_size)
-    return PreprocessParams(
-        model_input_size=_as_int(size),
-        chip_size_hint=_as_int(_get(hp, "chip_size", PreprocessParams.chip_size_hint)),
-        normalize_01=_as_bool(_get(hp, "normalize_01", PreprocessParams.normalize_01)),
-    )
+def parse_preprocess_params(params: Mapping[str, Any] | None) -> PreprocessParams:
+    """`model_input_size` is canonical; `chip_size` (the fAIr name) is an alias."""
+    given = params or {}
+    size = _as_int(_get(given, ("model_input_size", "chip_size"), PreprocessParams.model_input_size))
+    if size < 32 or size % 32:
+        raise ValueError(f"model_input_size must be a multiple of 32 and at least 32, got {size}")
+    return PreprocessParams(model_input_size=size)
 
 
 def parse_postprocess_params(params: Mapping[str, Any] | None) -> PostprocessParams:
-    p = params or {}
+    """`confidence_threshold` and `nms_threshold` are canonical; the other names are aliases."""
+    given = params or {}
     return PostprocessParams(
-        confidence_threshold=_as_float(_get(p, "confidence_threshold", PostprocessParams.confidence_threshold)),
-        iou_threshold=_as_float(_get(p, "iou_threshold", PostprocessParams.iou_threshold)),
-        min_box_area_px=_as_float(_get(p, "min_box_area_px", PostprocessParams.min_box_area_px)),
+        confidence_threshold=_check_unit(
+            "confidence_threshold",
+            _as_float(
+                _get(
+                    given,
+                    ("confidence_threshold", "score_thresh"),
+                    PostprocessParams.confidence_threshold,
+                )
+            ),
+        ),
+        nms_threshold=_check_unit(
+            "nms_threshold",
+            _as_float(
+                _get(
+                    given,
+                    ("nms_threshold", "iou_threshold", "nms_thresh"),
+                    PostprocessParams.nms_threshold,
+                )
+            ),
+        ),
     )
 
 
-def parse_inference_params(params: Mapping[str, Any] | None) -> InferenceParams:
-    """Parse inference params (what fAIr passes to `predict(..., params=...)`)."""
-    post = parse_postprocess_params(params)
-    return InferenceParams(
-        confidence_threshold=post.confidence_threshold,
-        iou_threshold=post.iou_threshold,
-        min_box_area_px=post.min_box_area_px,
+def parse_train_params(params: Mapping[str, Any] | None) -> TrainParams:
+    """`learning_rate` is canonical, `lr` an alias; `freeze_backbone` is an alias of `freeze_encoder`."""
+    given = params or {}
+    epochs = _as_int(_get(given, ("epochs",), TrainParams.epochs))
+    batch_size = _as_int(_get(given, ("batch_size",), TrainParams.batch_size))
+    learning_rate = _as_float(_get(given, ("learning_rate", "lr"), TrainParams.learning_rate))
+    if epochs < 1 or batch_size < 1:
+        raise ValueError(f"epochs and batch_size must be >= 1, got {epochs} and {batch_size}")
+    if not math.isfinite(learning_rate) or learning_rate <= 0:
+        raise ValueError(f"learning_rate must be a positive number, got {learning_rate}")
+    return TrainParams(
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        freeze_encoder=_as_bool(
+            _get(given, ("freeze_encoder", "freeze_backbone"), TrainParams.freeze_encoder)
+        ),
+        device=str(_get(given, ("device",), TrainParams.device)),
     )
-
-

@@ -1,103 +1,73 @@
-"""YOLO ONNX decoding helpers."""
+"""ONNX output -> detections in model-input pixels (no CRS or affine dependence).
+
+The graph returns `output0` with shape `(1, 4 + nc, anchors)`: for every anchor `cx, cy, w, h` in model-input pixels,
+then one sigmoid score per class. Decoding here is the confidence filter, per-class NMS and the per-chip cap.
+"""
 
 from typing import Any
 
 import numpy as np
 
+from .params import MAX_DETECTIONS, PostprocessParams
 
-def nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
-    """Perform standard NMS on XYXY boxes."""
+
+def nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
+    """Greedy NMS on XYXY boxes; returns kept indices in descending score order."""
     if len(boxes) == 0:
         return []
-
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
     order = scores.argsort()[::-1]
     keep: list[int] = []
-
     while order.size > 0:
         i = int(order[0])
         keep.append(i)
-        if order.size == 1:
+        rest = order[1:]
+        if rest.size == 0:
             break
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
-        order = order[1:][iou <= iou_threshold]
+        overlap_w = np.maximum(0.0, np.minimum(x2[i], x2[rest]) - np.maximum(x1[i], x1[rest]))
+        overlap_h = np.maximum(0.0, np.minimum(y2[i], y2[rest]) - np.maximum(y1[i], y1[rest]))
+        inter = overlap_w * overlap_h
+        iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
+        order = rest[iou <= iou_threshold]
     return keep
 
 
-def _is_yolo_feature_dim(size: int) -> bool:
-    """True when a matrix axis likely holds `(cx, cy, w, h, class_scores...)`."""
-    return 5 <= size <= 256
+def decode_detections(output: Any, cfg: PostprocessParams | None = None) -> list[dict[str, float | int]]:
+    """`output0` of one chip -> detections `x1, y1, x2, y2, confidence, class_id`, best first, in model-input pixels.
 
+    Raises `ValueError` for any other layout, instead of guessing which axis holds the features.
+    """
+    cfg = cfg or PostprocessParams()
+    preds = np.asarray(output, dtype=np.float32)
+    if preds.ndim == 3 and preds.shape[0] == 1:
+        preds = preds[0]
+    # The features are the short axis: a transposed (1, anchors, 4 + nc) tensor is refused, not read as features.
+    if preds.ndim != 2 or preds.shape[0] < 5 or preds.shape[0] > preds.shape[1]:
+        raise ValueError(f"expected YOLO output (1, 4 + nc, anchors), got shape {np.asarray(output).shape}")
 
-def _to_anchors_by_features(preds: np.ndarray) -> np.ndarray:
-    """Normalize YOLO ONNX layouts to `(num_anchors, 4 + num_classes)`."""
-    rows, cols = preds.shape
-    rows_are_features = _is_yolo_feature_dim(rows)
-    cols_are_features = _is_yolo_feature_dim(cols)
-
-    if rows_are_features and not cols_are_features:
-        return preds.transpose(1, 0)
-    if cols_are_features and not rows_are_features:
-        return preds
-    if rows < cols:
-        return preds.transpose(1, 0)
-    return preds
-
-
-def decode_yolo_onnx_output(
-    output: Any,
-    confidence_threshold: float,
-    iou_threshold: float,
-) -> list[dict[str, float | int]]:
-    """Decode YOLO ONNX output shaped like `(1, 4+nc, anchors)` or `(1, anchors, 4+nc)`."""
-    preds = np.squeeze(np.asarray(output), axis=0)
-    if preds.ndim != 2:
-        raise ValueError(f"Unexpected YOLO output shape after squeeze: {preds.shape}")
-
-    preds = _to_anchors_by_features(preds)
-
-    boxes_cxcywh = preds[:, :4]
-    class_scores = preds[:, 4:]
-    if class_scores.shape[1] == 0:
-        return []
-
+    cx, cy, w, h = preds[:4]
+    class_scores = preds[4:].T
+    scores = class_scores.max(axis=1)
     class_ids = class_scores.argmax(axis=1)
-    confidences = class_scores.max(axis=1)
-    keep = confidences >= confidence_threshold
-    if not keep.any():
-        return []
+    keep = scores > cfg.confidence_threshold
+    cx, cy, w, h = cx[keep], cy[keep], w[keep], h[keep]
+    scores, class_ids = scores[keep], class_ids[keep]
+    boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
 
-    boxes_cxcywh = boxes_cxcywh[keep]
-    confidences = confidences[keep]
-    class_ids = class_ids[keep]
-
-    cx, cy, w, h = boxes_cxcywh[:, 0], boxes_cxcywh[:, 1], boxes_cxcywh[:, 2], boxes_cxcywh[:, 3]
-    boxes_xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
-    keep_idx = nms_xyxy(boxes_xyxy, confidences, iou_threshold)
-
-    decoded: list[dict[str, float | int]] = []
-    for idx in keep_idx:
-        x1, y1, x2, y2 = boxes_xyxy[idx]
-        decoded.append(
-            {
-                "x1": float(x1),
-                "y1": float(y1),
-                "x2": float(x2),
-                "y2": float(y2),
-                "confidence": float(confidences[idx]),
-                "class_id": int(class_ids[idx]),
-            }
-        )
-    return decoded
-
+    kept: list[int] = []
+    for class_id in np.unique(class_ids):
+        members = np.flatnonzero(class_ids == class_id)
+        kept.extend(int(members[i]) for i in nms(boxes[members], scores[members], cfg.nms_threshold))
+    kept.sort(key=lambda i: -scores[i])
+    return [
+        {
+            "x1": float(boxes[i, 0]),
+            "y1": float(boxes[i, 1]),
+            "x2": float(boxes[i, 2]),
+            "y2": float(boxes[i, 3]),
+            "confidence": float(scores[i]),
+            "class_id": int(class_ids[i]),
+        }
+        for i in kept[:MAX_DETECTIONS]
+    ]

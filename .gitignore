@@ -7,3 +7,17 @@ __pycache__/
 *.jpeg
 *.tif
 *.tiff
+
+
+## Assistant LLM
+.DS_Store
+.vscode
+.cursorrules
+.agents
+.test-tmp/
+AGENTS.md
+
+# research and downloaded data
+data/
+research/
+*.onnx

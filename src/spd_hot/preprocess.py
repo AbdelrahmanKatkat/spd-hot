@@ -1,11 +1,17 @@
-"""Image preprocessing helpers for ONNX inference."""
+"""Chip -> model input: read the RGB bands, divide by 255 and resize to the model's square input.
+
+The ONNX graph does NOT normalise: its first node is a convolution on `images`, so this module delivers RGB float32
+in [0, 1]. That division by 255 is the whole normalisation Ultralytics uses; the model has no mean or std. The base
+model saw 512 px images of one zoom-18 tile, so a 256 px zoom-18 chip resized to 512 has the training scale (see
+`params.MODEL_INPUT_SIZE`); the resize here does not look at the chip's zoom, so other zooms are not rescaled to it.
+The batch axis is added at serving time (`serve.detect_chip`), so one chip is `(3, S, S)` here.
+"""
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import rasterio
 from PIL import Image
 
 from .params import PreprocessParams
@@ -13,59 +19,73 @@ from .params import PreprocessParams
 
 @dataclass(frozen=True)
 class PreprocessMeta:
-    """Metadata required to map detections back to source chip coordinates."""
+    """Everything needed to map detections back to chip pixels and then to the map."""
 
-    width: int
+    width: int  # source chip, pixels
     height: int
-    scale_x: float
-    scale_y: float
+    resized_width: int  # model input, pixels
+    resized_height: int
     transform: Any
     crs: Any
 
+    @property
+    def scale_x(self) -> float:
+        return self.resized_width / self.width
 
-def _resize_rgb(rgb_hwc: np.ndarray, target_size: int) -> tuple[np.ndarray, float, float]:
-    h, w, _ = rgb_hwc.shape
-    resized = np.asarray(Image.fromarray(rgb_hwc).resize((target_size, target_size), Image.Resampling.BILINEAR))
-    scale_x = target_size / w
-    scale_y = target_size / h
-    return resized, scale_x, scale_y
+    @property
+    def scale_y(self) -> float:
+        return self.resized_height / self.height
 
 
-def preprocess_chip_for_onnx(image_path: str | Path, cfg: PreprocessParams | None = None) -> tuple[np.ndarray, PreprocessMeta]:
-    """Read one chip and return ONNX-ready tensor and metadata.
+def read_chip(image_path: str | Path) -> tuple[np.ndarray, Any, Any]:
+    """Read bands 1-3 as uint8 HWC RGB plus the chip's affine transform and CRS.
 
-    Output tensor shape is always `(1, 3, size, size)` (NCHW).
+    PNG/JPEG chips have no georeferencing: the transform is the identity and the CRS is `None`.
     """
-
-    cfg = cfg or PreprocessParams()
+    import rasterio
 
     with rasterio.open(image_path) as src:
-        # Read once and convert to HWC (uint8) for one-pass resize.
+        if src.count < 3:
+            raise ValueError(f"{image_path}: expected >= 3 bands (RGB), found {src.count}")
         rgb = src.read([1, 2, 3]).transpose(1, 2, 0)
-        rgb_hwc = np.clip(rgb, 0, 255).astype(np.uint8)
-        transform = src.transform
-        crs = src.crs
-        width = src.width
-        height = src.height
+        return np.clip(rgb, 0, 255).astype(np.uint8), src.transform, src.crs
 
-    resized, scale_x, scale_y = _resize_rgb(
-        rgb_hwc,
-        target_size=cfg.model_input_size,
-    )
 
-    arr = resized.astype(np.float32)
-    if cfg.normalize_01:
-        arr = arr / 255.0
+def preprocess_rgb(
+    rgb_hwc: np.ndarray, model_input_size: int, *, transform: Any = None, crs: Any = None
+) -> tuple[np.ndarray, PreprocessMeta]:
+    """RGB uint8 chip -> `(3, S, S)` float32 in [0, 1] plus `PreprocessMeta`.
 
-    batch = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
-
+    One bilinear resize per channel to `S x S`. The aspect ratio is not kept: OAM chips are square, so nothing is
+    distorted.
+    """
+    if rgb_hwc.ndim != 3 or rgb_hwc.shape[2] != 3:
+        raise ValueError(f"expected HxWx3 RGB array, got shape {rgb_hwc.shape}")
+    h, w, _ = rgb_hwc.shape
+    chw = rgb_hwc.astype(np.float32).transpose(2, 0, 1) / 255.0
+    resized = np.empty((3, model_input_size, model_input_size), dtype=np.float32)
+    for channel in range(3):
+        resized[channel] = np.asarray(
+            Image.fromarray(chw[channel]).resize(
+                (model_input_size, model_input_size), Image.Resampling.BILINEAR
+            ),
+            dtype=np.float32,
+        )
     meta = PreprocessMeta(
-        width=width,
-        height=height,
-        scale_x=scale_x,
-        scale_y=scale_y,
+        width=w,
+        height=h,
+        resized_width=model_input_size,
+        resized_height=model_input_size,
         transform=transform,
         crs=crs,
     )
-    return batch.astype(np.float32), meta
+    return resized, meta
 
+
+def preprocess_chip(
+    image_path: str | Path, cfg: PreprocessParams | None = None
+) -> tuple[np.ndarray, PreprocessMeta]:
+    """Read a chip and resize it to the model input (`cfg.model_input_size`)."""
+    cfg = cfg or PreprocessParams()
+    rgb, transform, crs = read_chip(image_path)
+    return preprocess_rgb(rgb, cfg.model_input_size, transform=transform, crs=crs)

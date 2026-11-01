@@ -1,22 +1,24 @@
-"""ONNX export wrapper for Ultralytics models."""
+"""ONNX export of the fine-tuned YOLO (needs the `train` extra; import explicitly).
 
+The file is Ultralytics' own export at the model input size: input `images` (1, 3, S, S) float32 in [0, 1], output
+`output0` (1, 4 + nc, anchors). The confidence filter and NMS stay outside it (`decode.py`), as for the detector.
+"""
+
+import tempfile
 from pathlib import Path
 
+from .params import MODEL_INPUT_SIZE
 
-def export_onnx_bytes(model, *, imgsz: int | None = None) -> bytes:
-    """Export a YOLO model to ONNX, validate it, and return file bytes."""
+
+def export_onnx_bytes(model, *, imgsz: int = MODEL_INPUT_SIZE) -> bytes:
+    """Export a YOLO model to ONNX at `imgsz`, check the graph, and return the file bytes."""
     import onnx
+    from ultralytics import YOLO
 
-    size = imgsz
-    if size is None:
-        raw = getattr(getattr(model, "args", None), "imgsz", 640)
-        size = int(raw[0] if isinstance(raw, (list, tuple)) else raw)
-    onnx_path = Path(model.export(format="onnx", imgsz=size))
-    proto = onnx.load(onnx_path)
-    onnx.save_model(proto, onnx_path, save_as_external_data=False)
-    onnx.checker.check_model(onnx_path)
-    try:
+    with tempfile.TemporaryDirectory() as tmp:
+        # Ultralytics writes the ONNX next to the checkpoint it loads, so export from a copy in a temporary folder.
+        checkpoint = Path(tmp) / "export.pt"
+        model.save(checkpoint)
+        onnx_path = Path(YOLO(str(checkpoint)).export(format="onnx", imgsz=imgsz))
+        onnx.checker.check_model(str(onnx_path))
         return onnx_path.read_bytes()
-    finally:
-        onnx_path.unlink(missing_ok=True)
-

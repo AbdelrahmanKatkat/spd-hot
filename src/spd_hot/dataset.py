@@ -1,249 +1,193 @@
-"""Dataset helpers for YOLO fine-tuning (labels + splitting).
+"""Dataset helpers for spd-hot (numpy, rasterio, pyproj; no torch and no shapely, safe at serving time).
 
-fAIr provides training assets as:
-- `dataset_chips`: directory of RGB GeoTIFF chips (often `OAM-x-y-z.tif`)
-- `dataset_labels`: directory containing GeoJSON polygon labels (OSM-derived)
+- `list_chip_paths`, `spatial_split`: find the chips and split them into train and validation.
+- `build_chip_labels`: a GeoJSON of swimming-pool polygons -> the pixel boxes of each chip, nothing copied.
 
-Ultralytics YOLO training expects a YOLO dataset directory:
-- images/{train,val}/*.tif
-- labels/{train,val}/*.txt   (YOLO bbox format, normalized 0..1)
-- data.yaml
+The rules that pick the pools from a source file (tags, indoor pools) are dataset-specific and live in `research/`.
 """
 
 import json
-import re
-import shutil
-import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-OAM_TILE_RE = re.compile(r"^OAM-(\d+)-(\d+)-(\d+)\.(tif|tiff|png|jpg|jpeg)$", re.IGNORECASE)
+from .tiles import CHIP_PATTERNS, parse_oam_tile
+
+LABEL_SUFFIXES = (".geojson", ".json")
+POLYGON_TYPES = ("Polygon", "MultiPolygon")
+
+
+def list_chip_paths(root: str | Path) -> list[Path]:
+    """Chips in a folder, sorted by name. Each name must be a canonical OAM name."""
+    folder = Path(root)
+    paths = sorted(path for pattern in CHIP_PATTERNS for path in folder.glob(pattern) if path.is_file())
+    for path in paths:
+        parse_oam_tile(path.name)
+    return paths
 
 
 def spatial_split(
-    chip_names: list[str],
-    val_ratio: float,
-    seed: int,
-    *,
-    block_size: int = 4,
+    chip_names: Sequence[str], val_ratio: float, seed: int, *, block_size: int = 4
 ) -> tuple[list[str], list[str]]:
-    """Block-spatial split on OAM tile coords; entire `(x//K, y//K)` blocks pick a side.
+    """Block-spatial split on OAM tile coords; whole blocks of `block_size` tiles go to one side.
 
-    Chips that do not match `OAM-x-y-z` are shuffled and used only to fill leftover val slots.
+    Neighbouring chips share pools cut at chip borders and similar surroundings, so a random chip split leaks.
+    Coordinates of different zooms are mapped to the finest zoom first. Names must be `OAM-x-y-z.ext`.
+    Returns sorted `(train, val)` name lists.
     """
-    matched: dict[tuple[int, int], list[str]] = {}
-    unmatched: list[str] = []
-    for name in chip_names:
-        oam_match = OAM_TILE_RE.match(name)
-        if oam_match is None:
-            unmatched.append(name)
-            continue
-        tile_x, tile_y = int(oam_match.group(1)), int(oam_match.group(2))
-        matched.setdefault((tile_x // block_size, tile_y // block_size), []).append(name)
+    parsed = [(name, *parse_oam_tile(name)) for name in chip_names]
+    max_zoom = max((zoom for _, _, _, zoom in parsed), default=0)
+    blocks_map: dict[tuple[int, int], list[str]] = {}
+    for name, tile_x, tile_y, zoom in parsed:
+        factor = 2 ** (max_zoom - zoom)
+        blocks_map.setdefault((tile_x * factor // block_size, tile_y * factor // block_size), []).append(name)
 
     rng = np.random.default_rng(seed)
-    blocks = sorted(matched.keys())
+    blocks = sorted(blocks_map)
     rng.shuffle(blocks)
 
-    n_total = sum(len(v) for v in matched.values()) + len(unmatched)
-    n_val_target = max(1, int(n_total * val_ratio)) if n_total else 0
-
+    n_val_target = max(1, int(len(chip_names) * val_ratio)) if chip_names else 0
     val: list[str] = []
     train: list[str] = []
     for block in blocks:
-        bucket = val if len(val) < n_val_target else train
-        bucket.extend(matched[block])
-
-    if unmatched:
-        leftover = sorted(unmatched)
-        rng.shuffle(leftover)
-        remaining = max(0, n_val_target - len(val))
-        val.extend(leftover[:remaining])
-        train.extend(leftover[remaining:])
-
+        (val if len(val) < n_val_target else train).extend(blocks_map[block])
     return sorted(train), sorted(val)
 
 
-def _resolve_geojson(labels_path: str | Path) -> Path:
-    p = Path(labels_path)
-    if p.is_file():
-        if p.suffix.lower() != ".geojson":
-            raise ValueError(f"labels_path must be a .geojson file or a directory containing one, got {p}")
-        return p
-    geojsons = sorted(p.rglob("*.geojson"))
-    if not geojsons:
-        raise FileNotFoundError(f"No .geojson labels found under {p}")
-    if len(geojsons) != 1:
-        raise ValueError(f"Expected exactly one .geojson under {p}, found {len(geojsons)}")
-    return geojsons[0]
+def _find_labels_geojson(labels: str | Path) -> Path:
+    """The labels file: the path itself if it is a `.geojson` / `.json` file, else the one such file under a folder."""
+    root = Path(labels)
+    if root.is_file() and root.suffix.lower() in LABEL_SUFFIXES:
+        return root
+    matches = sorted(root.rglob("*.geojson")) or sorted(root.rglob("*.json"))
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one .geojson (or .json) in {root}, found {len(matches)}")
+    return matches[0]
 
 
-def _labels_crs_from_geojson(data: dict[str, Any]) -> str:
-    """Best-effort CRS detection for fAIr label GeoJSON.
-
-    - If a `crs` member exists, we try to read an EPSG-like name from it.
-    """
-    crs_obj = data.get("crs")
-    if not isinstance(crs_obj, dict):
-        return "EPSG:4326"
-    props = crs_obj.get("properties")
-    if not isinstance(props, dict):
-        return "EPSG:4326"
-    name = props.get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip()
+def _parse_geojson_crs(feature_collection: dict[str, Any]) -> str:
+    """CRS name from the legacy GeoJSON `crs` member; RFC 7946 files default to EPSG:4326."""
+    crs = feature_collection.get("crs")
+    if isinstance(crs, dict):
+        props = crs.get("properties")
+        if isinstance(props, dict) and isinstance(props.get("name"), str) and props["name"]:
+            return props["name"]
     return "EPSG:4326"
 
 
-def _reset_yolo_dirs(yolo_dir: Path) -> None:
-    if yolo_dir.exists():
-        shutil.rmtree(yolo_dir)
-    for split in ("train", "val"):
-        (yolo_dir / "images" / split).mkdir(parents=True, exist_ok=True)
-        (yolo_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+def _iter_xy_coords(node: Any) -> list[tuple[float, float]]:
+    """All `(x, y)` pairs in a GeoJSON `coordinates` structure (any nesting, extra dimensions ignored)."""
+    pairs: list[tuple[float, float]] = []
+
+    def _walk(item: Any) -> None:
+        if not isinstance(item, (list, tuple)):
+            return
+        if len(item) >= 2 and all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) for value in item
+        ):
+            pairs.append((float(item[0]), float(item[1])))
+            return
+        for child in item:
+            _walk(child)
+
+    _walk(node)
+    return pairs
 
 
-def _copy_chip_with_sidecars(src: Path, dst: Path) -> None:
-    """Materialize a chip into the YOLO dataset tree.
+def read_label_bounds(labels_geojson: str | Path) -> tuple[np.ndarray, str]:
+    """Bounds `(N, 4)` of every polygon as `(minx, miny, maxx, maxy)` in the file CRS, plus that CRS.
 
-    Prefer symlinks to avoid duplicating large chip files inside training jobs.
-    Fall back to full copies when symlinks are not supported.
+    Only polygons are pools. Points (a pool mapped as a node has no outline) and lines are skipped.
     """
-    try:
-        dst.symlink_to(src)
-    except OSError:
-        shutil.copy2(src, dst)
-
-    # OAM chips sometimes store geotransform / projection as sidecars.
-    for ext in (".aux.xml", ".tfw", ".prj"):
-        sidecar = src.parent / (src.name + ext)
-        if not sidecar.exists():
+    collection = json.loads(Path(labels_geojson).read_text(encoding="utf-8"))
+    if not isinstance(collection, dict) or collection.get("type") != "FeatureCollection":
+        raise ValueError("labels file must be a GeoJSON FeatureCollection")
+    features = collection.get("features", [])
+    if not isinstance(features, list):
+        raise TypeError("GeoJSON FeatureCollection 'features' must be a list")
+    bounds: list[tuple[float, float, float, float]] = []
+    for feature in features:
+        geom = feature.get("geometry") if isinstance(feature, dict) else None
+        if not isinstance(geom, dict) or geom.get("type") not in POLYGON_TYPES:
             continue
-        out_sidecar = dst.parent / sidecar.name
-        try:
-            out_sidecar.symlink_to(sidecar)
-        except OSError:
-            shutil.copy2(sidecar, out_sidecar)
+        coords = _iter_xy_coords(geom.get("coordinates"))
+        if coords:
+            xs, ys = zip(*coords)
+            bounds.append((min(xs), min(ys), max(xs), max(ys)))
+    return np.asarray(bounds, dtype=np.float64).reshape(-1, 4), _parse_geojson_crs(collection)
 
 
-def prepare_yolo_detection_dataset_from_geojson(
-    chips_path: str | Path,
-    labels_path: str | Path,
-    *,
-    class_name: str = "swimming_pool",
-    val_ratio: float = 0.2,
-    seed: int = 42,
-    block_size: int = 4,
-    out_dir: str | Path | None = None,
-) -> tuple[Path, dict[str, Any]]:
-    """Build a YOLO detection dataset dir from GeoTIFF chips + GeoJSON polygons.
-
-    Returns `(yolo_dir, split_info)` where `split_info["_yolo_dir"]` points to `yolo_dir`.
-    """
-    import rasterio
-    from .geo_to_yolo_converter import pixel_bbox_xyxy_to_yolo_txt_line, world_bounds_to_pixel_bbox_xyxy
-
-    from shapely.geometry import box, shape
-    from shapely.ops import transform as shapely_transform
-    from shapely.strtree import STRtree
+def _project_bounds(bounds: np.ndarray, src_crs: Any, dst_crs: Any) -> np.ndarray:
+    """Reproject `(N, 4)` bounds by projecting all four corners and re-bounding."""
+    if len(bounds) == 0 or src_crs is None or dst_crs is None or str(src_crs) == str(dst_crs):
+        return bounds
     from pyproj import Transformer
 
-    chips_root = Path(chips_path)
-    if chips_root.is_file():
-        raise ValueError(f"chips_path must be a directory, got file: {chips_root}")
+    transformer = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    xs = np.stack([bounds[:, 0], bounds[:, 0], bounds[:, 2], bounds[:, 2]], axis=1)
+    ys = np.stack([bounds[:, 1], bounds[:, 3], bounds[:, 1], bounds[:, 3]], axis=1)
+    out_x, out_y = transformer.transform(xs, ys)
+    return np.stack([out_x.min(axis=1), out_y.min(axis=1), out_x.max(axis=1), out_y.max(axis=1)], axis=1)
 
-    chip_files = sorted([*chips_root.rglob("*.tif"), *chips_root.rglob("*.tiff")])
-    if not chip_files:
-        raise FileNotFoundError(f"No .tif/.tiff chips found under {chips_root}")
 
-    geojson_path = _resolve_geojson(labels_path)
-    data = json.loads(geojson_path.read_text(encoding="utf-8"))
-    features = data.get("features", [])
-    raw_polys = [shape(f["geometry"]) for f in features if isinstance(f, dict) and f.get("geometry")]
-    labels_crs = _labels_crs_from_geojson(data)
+def chip_boxes(
+    chip_path: str | Path,
+    *,
+    label_bounds: np.ndarray,
+    labels_crs: Any,
+    class_id: int = 0,
+    min_box_px: float = 0.0,
+) -> list[dict[str, float | int]]:
+    """Label bounds -> XYXY boxes in chip pixels, clipped to the chip.
 
-    # Project polygons once to the chip CRS if needed.
-    with rasterio.open(chip_files[0]) as src0:
-        chip_crs = src0.crs
-    polys = raw_polys
-    if chip_crs is not None and str(chip_crs) != labels_crs:
-        to_chip = Transformer.from_crs(labels_crs, chip_crs, always_xy=True)
-        polys = [
-            shapely_transform(lambda x, y, _z=None: to_chip.transform(x, y), p)  # type: ignore[misc]
-            for p in raw_polys
-        ]
+    A box is the bounds of its polygon, clipped to the chip: a pool that crosses the chip edge keeps its part inside.
+    Boxes off the chip are dropped, and so are boxes thinner than `min_box_px` after clipping.
+    """
+    import rasterio
 
-    tree = STRtree(polys) if polys else None
+    with rasterio.open(chip_path) as src:
+        width, height, transform, crs = int(src.width), int(src.height), src.transform, src.crs
+    if crs is None:
+        raise ValueError(f"{chip_path} has no CRS; GeoJSON labels need a georeferenced GeoTIFF chip")
+    if len(label_bounds) == 0:
+        return []
 
-    # Split by chip *names* (stable + consistent with fAIr examples).
-    chip_names = [p.name for p in chip_files]
-    train_names, val_names = spatial_split(chip_names, val_ratio, seed, block_size=block_size)
-    split_of: dict[str, str] = {n: "train" for n in train_names}
-    split_of.update({n: "val" for n in val_names})
+    projected = _project_bounds(label_bounds, labels_crs, crs)
+    corner_x = np.stack([projected[:, 0], projected[:, 0], projected[:, 2], projected[:, 2]], axis=1)
+    corner_y = np.stack([projected[:, 1], projected[:, 3], projected[:, 1], projected[:, 3]], axis=1)
+    inv = ~transform
+    # Explicit affine maths (same reason as georef.py): works across `affine` versions.
+    cols = inv.a * corner_x + inv.b * corner_y + inv.c
+    rows = inv.d * corner_x + inv.e * corner_y + inv.f
+    x1, x2 = np.clip(cols.min(axis=1), 0, width), np.clip(cols.max(axis=1), 0, width)
+    y1, y2 = np.clip(rows.min(axis=1), 0, height), np.clip(rows.max(axis=1), 0, height)
+    keep = (x2 > x1) & (y2 > y1) & (x2 - x1 >= min_box_px) & (y2 - y1 >= min_box_px)
+    return [
+        {
+            "x1": float(left),
+            "y1": float(top),
+            "x2": float(right),
+            "y2": float(bottom),
+            "class_id": int(class_id),
+        }
+        for left, top, right, bottom in zip(x1[keep], y1[keep], x2[keep], y2[keep])
+    ]
 
-    # No deterministic cache by default: this is a training-job artifact, and it's safer to
-    # build a fresh directory per run unless the caller explicitly chooses a location.
-    yolo_dir = Path(out_dir) if out_dir is not None else Path(tempfile.mkdtemp(prefix="spd_hot_yolo_dataset_"))
-    _reset_yolo_dirs(yolo_dir)
 
-    # Build labels per chip.
-    for chip in chip_files:
-        split = split_of.get(chip.name, "train")
-        out_img = yolo_dir / "images" / split / chip.name
-        _copy_chip_with_sidecars(chip, out_img)
+def build_chip_labels(
+    chips_dir: str | Path, labels: str | Path, *, class_id: int = 0, min_box_px: float = 2.0
+) -> dict[str, list[dict[str, float | int]]]:
+    """Pixel boxes of every chip in `chips_dir` from one GeoJSON of pool polygons.
 
-        with rasterio.open(chip) as src:
-            chip_box = box(*src.bounds)
-            transform = src.transform
-            width, height = src.width, src.height
-
-        if tree is not None:
-            # Shapely 2.x STRtree.query returns candidate indices, not geometries.
-            candidate_indices = tree.query(chip_box)
-            candidates = [polys[int(i)] for i in np.atleast_1d(candidate_indices)]
-        else:
-            candidates = polys
-        lines: list[str] = []
-        for poly in candidates:
-            if not poly.intersects(chip_box):
-                continue
-            clipped = poly.intersection(chip_box)
-            if clipped.is_empty:
-                continue
-            minx, miny, maxx, maxy = clipped.bounds
-            x1, y1, x2, y2 = world_bounds_to_pixel_bbox_xyxy(
-                transform=transform,
-                width=width,
-                height=height,
-                minx=float(minx),
-                miny=float(miny),
-                maxx=float(maxx),
-                maxy=float(maxy),
-            )
-            line = pixel_bbox_xyxy_to_yolo_txt_line(
-                class_id=0, x1=x1, y1=y1, x2=x2, y2=y2, width=width, height=height
-            )
-            if line is not None:
-                lines.append(line)
-
-        label_file = yolo_dir / "labels" / split / chip.with_suffix(".txt").name
-        label_file.write_text("\n".join(lines), encoding="utf-8")
-
-    (yolo_dir / "data.yaml").write_text(
-        f"path: {yolo_dir}\ntrain: images/train\nval: images/val\nnc: 1\nnames: ['{class_name}']\n",
-        encoding="utf-8",
-    )
-
-    split_info = {
-        "strategy": "spatial",
-        "val_ratio": float(val_ratio),
-        "seed": int(seed),
-        "block_size": int(block_size),
-        "train_count": len(train_names),
-        "val_count": len(val_names),
-        "class_name": class_name,
-        "_yolo_dir": str(yolo_dir),
+    `labels` is the `.geojson` / `.json` file, or a folder holding exactly one. Nothing is copied, so a pipeline step can
+    call this on the chips and labels it was given. Chips without a pool get an empty list (negative examples).
+    """
+    bounds, crs = read_label_bounds(_find_labels_geojson(labels))
+    return {
+        path.name: chip_boxes(
+            path, label_bounds=bounds, labels_crs=crs, class_id=class_id, min_box_px=min_box_px
+        )
+        for path in list_chip_paths(chips_dir)
     }
-    return yolo_dir, split_info
