@@ -1,6 +1,6 @@
 import pytest
 
-from spd_hot.evaluate import match_detections, score_session, sweep_confidence
+from spd_hot.evaluate import match_detections, score_map, score_session, sweep_confidence
 from spd_hot.params import MODEL_INPUT_SIZE
 
 from .conftest import CHIP_NAME, FakeSession, yolo_output
@@ -55,3 +55,47 @@ def test_the_sweep_shows_the_precision_gain_of_a_higher_threshold(chips_dir):
     assert low["fp"] == 1.0 and high["fp"] == 0.0
     assert high["precision"] == pytest.approx(1.0)
     assert high["detections"] == 1.0
+
+
+def _model_box(x1, y1, x2, y2):
+    """A chip-pixel box as the `(cx, cy, w, h)` the model would output for the 10 px test chip."""
+    return ((x1 + x2) / 2 * SCALE, (y1 + y2) / 2 * SCALE, (x2 - x1) * SCALE, (y2 - y1) * SCALE)
+
+
+def test_map_of_an_exact_detection_is_the_interpolated_maximum(chips_dir):
+    session = FakeSession(yolo_output([_model_box(4, 4, 6, 6)], [0.9]))
+    scores = score_map(session, images_dir=chips_dir, labels={CHIP_NAME: [TRUTH]})
+    # 101-point interpolation gives 0.995 for a perfect detector, as in Ultralytics.
+    assert scores["map50"] == pytest.approx(0.995, abs=1e-3)
+    assert scores["map50_95"] == pytest.approx(0.995, abs=1e-3)
+
+
+def test_a_confident_false_positive_ranked_first_halves_the_map(chips_dir):
+    boxes = [_model_box(1, 1, 2, 2), _model_box(4, 4, 6, 6)]
+    session = FakeSession(yolo_output(boxes, [0.9, 0.6]))
+    scores = score_map(session, images_dir=chips_dir, labels={CHIP_NAME: [TRUTH]})
+    assert scores["map50"] == pytest.approx(0.5, abs=0.01)
+
+
+def test_map_is_zero_without_detections_or_without_labels(chips_dir):
+    empty = FakeSession(yolo_output([], []))
+    assert score_map(empty, images_dir=chips_dir, labels={CHIP_NAME: [TRUTH]}) == {
+        "map50": 0.0,
+        "map50_95": 0.0,
+    }
+    detected = FakeSession(yolo_output([_model_box(4, 4, 6, 6)], [0.9]))
+    assert score_map(detected, images_dir=chips_dir, labels={}) == {"map50": 0.0, "map50_95": 0.0}
+
+
+def test_a_loose_box_counts_at_iou_50_but_lowers_map50_95(chips_dir):
+    # The box covers x 4..6 and y 4..5.6 of the 2 x 2 label: IoU 0.8.
+    session = FakeSession(yolo_output([_model_box(4, 4, 6, 5.6)], [0.9]))
+    scores = score_map(session, images_dir=chips_dir, labels={CHIP_NAME: [TRUTH]})
+    assert scores["map50"] == pytest.approx(0.995, abs=1e-3)
+    assert 0.4 < scores["map50_95"] < scores["map50"]
+
+
+def test_map_scores_only_the_named_chips(chips_dir):
+    session = FakeSession(yolo_output([_model_box(4, 4, 6, 6)], [0.9]))
+    scores = score_map(session, images_dir=chips_dir, labels={CHIP_NAME: [TRUTH]}, names=["other.tif"])
+    assert scores == {"map50": 0.0, "map50_95": 0.0}

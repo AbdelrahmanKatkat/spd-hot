@@ -26,6 +26,11 @@ MODEL_INPUT_SIZE = (
 MAX_DETECTIONS = 300  # per chip after NMS (Ultralytics' `max_det` default)
 FROZEN_LAYERS = 10  # Ultralytics `freeze` when the encoder is frozen: the YOLO11 backbone, layers 0 to 9
 
+# --- evaluation protocol (Ultralytics' validation, so mAP is comparable with its mAP50 and mAP50-95) ---
+MAP_IOU_THRESHOLDS = tuple(round(0.5 + 0.05 * step, 2) for step in range(10))  # 0.50, 0.55, ..., 0.95
+MAP_CONFIDENCE = 0.001  # keep nearly every box, so the precision-recall curve is complete
+MAP_NMS_IOU = 0.7  # NMS IoU of the validation
+
 
 @dataclass(frozen=True)
 class SplitParams:

@@ -83,7 +83,7 @@ network and the box decoding are inside the graph; the confidence filter and NMS
 | `dataset.py` | `spatial_split` (block split on OAM tile coordinates), GeoJSON polygons -> per-chip pixel boxes |
 | `yolo_dataset.py` | pixel boxes -> the Ultralytics folder (chips linked, not copied) and its removal (`train`) |
 | `train.py` | Ultralytics fine-tuning from a checkpoint (`train`) |
-| `evaluate.py` | precision / recall / F1 at one or several IoUs, confidence sweep (no torch: scores an ONNX session) |
+| `evaluate.py` | precision / recall / F1 at one or several IoUs, confidence sweep, mAP50 and mAP50-95 (`score_map`); no torch: scores an ONNX session |
 | `export.py` | ONNX bytes of a trained model at the model size (`train`) |
 
 `PreprocessMeta` (source chip size, model size, transform, CRS) is what `preprocess` returns, not a setting: it is
@@ -110,14 +110,17 @@ outlines live in a local `research/` folder (not committed): dataset-specific co
 
 A step trains from the original chips and GeoJSON. The Ultralytics folder it needs holds **links to the chips** (a
 symlink, else a hardlink; it fails instead of copying) and one small label file per chip, so it costs a few kilobytes
-per chip, not the chips again. Create it in a temporary folder so nothing outlives the step.
+per chip, not the chips again. Create it in a temporary folder so nothing outlives the step. Linking needs a symlink
+(Linux containers allow it) or, failing that, a hardlink, which needs the same drive as the chips: on Windows without
+symlink rights put the temporary folder on the chips' drive (`tempfile.TemporaryDirectory(dir=...)`), or
+`write_yolo_dataset` raises instead of copying.
 
 ```python
 import tempfile
 from pathlib import Path
 
 from spd_hot import build_chip_labels, parse_preprocess_params, parse_split_params, spatial_split
-from spd_hot.evaluate import score_session                 # no torch: scores the exported ONNX
+from spd_hot.evaluate import score_map, score_session      # no torch: score the exported ONNX
 from spd_hot.export import export_onnx_bytes               # `train` extra, imported inside the step
 from spd_hot.params import parse_train_params
 from spd_hot.train import train
@@ -134,7 +137,8 @@ with tempfile.TemporaryDirectory() as work:                # the links, labels a
                   pre=pre, project_dir=Path(work) / "runs",
                   on_epoch_end=lambda epoch, train_loss, val_loss: ...)   # -> MLflow
     onnx_bytes = export_onnx_bytes(model, imgsz=pre.model_input_size)
-metrics = score_session(onnx_session, images_dir=chips_dir, labels=labels, names=val_names)[0.5]
+prf = score_session(onnx_session, images_dir=chips_dir, labels=labels, names=val_names)[0.5]   # precision, recall, f1
+ap = score_map(onnx_session, images_dir=chips_dir, labels=labels, names=val_names)             # map50, map50_95
 ```
 
 `scripts/finetune.py` does the same on disk and removes `<out>/yolo` after a successful run (`--keep-dataset` keeps

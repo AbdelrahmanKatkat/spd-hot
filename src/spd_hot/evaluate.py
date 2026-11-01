@@ -1,4 +1,4 @@
-"""Precision, recall and F1 of a swimming-pool detector, through the same ONNX path that serves it (no torch).
+"""Precision, recall, F1 and mAP of a swimming-pool detector, through the same ONNX path that serves it (no torch).
 
 Predictions are mapped back to chip pixels (`serve.detect_chip`) before they are matched against the labels, which are
 chip-pixel boxes from `dataset.build_chip_labels`.
@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from .params import MAP_CONFIDENCE, MAP_IOU_THRESHOLDS, MAP_NMS_IOU
 from .serve import detect_chip, list_images
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,29 @@ def _iou_xyxy(box_a: np.ndarray, box_b: np.ndarray) -> float:
     return float(inter / (area_a + area_b - inter + 1e-9))
 
 
+def _hit_flags(
+    preds: Sequence[Mapping[str, Any]], gts: Sequence[Mapping[str, Any]], iou_threshold: float
+) -> list[tuple[float, bool]]:
+    """`(confidence, is_true_positive)` of each detection of one chip: greedy by confidence, one label per detection."""
+    gt_boxes = [np.asarray([gt["x1"], gt["y1"], gt["x2"], gt["y2"]], dtype=np.float32) for gt in gts]
+    used = [False] * len(gt_boxes)
+    flags: list[tuple[float, bool]] = []
+    for pred in sorted(preds, key=lambda det: -float(det.get("confidence", 0.0))):
+        pred_box = np.asarray([pred["x1"], pred["y1"], pred["x2"], pred["y2"]], dtype=np.float32)
+        best_iou, best_index = 0.0, -1
+        for index, gt_box in enumerate(gt_boxes):
+            if used[index]:
+                continue
+            iou = _iou_xyxy(pred_box, gt_box)
+            if iou > best_iou:
+                best_iou, best_index = iou, index
+        hit = best_index >= 0 and best_iou >= float(iou_threshold)
+        if hit:
+            used[best_index] = True
+        flags.append((float(pred.get("confidence", 0.0)), hit))
+    return flags
+
+
 def match_detections(
     preds: Sequence[Mapping[str, Any]],
     gts: Sequence[Mapping[str, Any]],
@@ -36,33 +60,8 @@ def match_detections(
     iou_threshold: float = 0.5,
 ) -> tuple[int, int, int]:
     """Greedy matching by confidence, one label per detection: returns `(tp, fp, fn)`."""
-    if not preds and not gts:
-        return 0, 0, 0
-    pred_boxes = [
-        np.asarray([pred["x1"], pred["y1"], pred["x2"], pred["y2"]], dtype=np.float32)
-        for pred in sorted(preds, key=lambda det: -float(det.get("confidence", 0.0)))
-    ]
-    gt_boxes = [np.asarray([gt["x1"], gt["y1"], gt["x2"], gt["y2"]], dtype=np.float32) for gt in gts]
-    used = [False] * len(gt_boxes)
-    tp = 0
-    fp = 0
-    for pred_box in pred_boxes:
-        best_iou = 0.0
-        best_index = -1
-        for gt_index, gt_box in enumerate(gt_boxes):
-            if used[gt_index]:
-                continue
-            iou = _iou_xyxy(pred_box, gt_box)
-            if iou > best_iou:
-                best_iou = iou
-                best_index = gt_index
-        if best_iou >= float(iou_threshold) and best_index >= 0:
-            used[best_index] = True
-            tp += 1
-        else:
-            fp += 1
-    fn = int(len(gt_boxes) - sum(used))
-    return int(tp), int(fp), int(fn)
+    tp = sum(hit for _, hit in _hit_flags(preds, gts, iou_threshold))
+    return tp, len(preds) - tp, len(gts) - tp
 
 
 def _prf(tp: int, fp: int, fn: int) -> dict[str, float]:
@@ -104,6 +103,68 @@ def _score(
             tally[2] += fn
         results[iou] = _prf(*tally)
     return results
+
+
+def _average_precision(flags: Sequence[tuple[float, bool]], n_labels: int) -> float:
+    """Area under the precision-recall curve of detections ranked by confidence (101-point interpolation)."""
+    if n_labels == 0 or not flags:
+        return 0.0
+    ranked = sorted(flags, key=lambda flag: -flag[0])
+    hits = np.asarray([hit for _, hit in ranked], dtype=np.float64)
+    true_positives = np.cumsum(hits)
+    false_positives = np.cumsum(1.0 - hits)
+    recall = true_positives / n_labels
+    precision = true_positives / (true_positives + false_positives)
+    # The curve ends at the highest recall reached: a second sentinel at that recall drops precision to 0 there, so
+    # no area is added between it and recall 1 (as in Ultralytics' `compute_ap`).
+    mrec = np.concatenate(([0.0], recall, [recall[-1]], [1.0]))
+    mpre = np.concatenate(([1.0], precision, [0.0], [0.0]))
+    mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))  # precision never rises as recall grows
+    grid = np.linspace(0.0, 1.0, 101)
+    curve = np.interp(grid, mrec, mpre)
+    return float(np.sum((curve[1:] + curve[:-1]) / 2 * np.diff(grid)))
+
+
+def score_map(
+    session: Any,
+    *,
+    images_dir: str | Path,
+    labels: Mapping[str, Sequence[Mapping[str, Any]]],
+    names: Sequence[str] | None = None,
+    params: dict[str, Any] | None = None,
+    confidence_threshold: float = MAP_CONFIDENCE,
+    nms_threshold: float = MAP_NMS_IOU,
+) -> dict[str, float]:
+    """`{"map50": ..., "map50_95": ...}` of the chips in `images_dir` (or only those in `names`), with no torch.
+
+    mAP50 is the average precision at IoU 0.5; mAP50-95 is its mean over IoU 0.50, 0.55, ..., 0.95. Every chip is
+    predicted once, with the confidence and NMS settings of Ultralytics' validation. The matching (by confidence, one
+    label per detection) and the average precision (101-point interpolation) are those of Ultralytics' validator: fed the
+    same detections, `ultralytics.utils.metrics.ap_per_class` returns the same mAP, and a perfect detector scores 0.995
+    in both. The detections themselves come from this library's resize (Pillow), not from Ultralytics' dataloader, so
+    the two can differ on the same chips. The confidence and NMS settings in `params` are not used:
+    a confidence filter at the serving value would cut the curve short. Labels are chip-pixel boxes, as in
+    `score_session`.
+    """
+    paths = _chips(images_dir, names)
+    predict_params = {
+        **(params or {}),
+        "confidence_threshold": confidence_threshold,
+        "nms_threshold": nms_threshold,
+    }
+    predictions = {path.name: detect_chip(session, path, predict_params)[0] for path in paths}
+    n_labels = sum(len(labels.get(name, [])) for name in predictions)
+    if n_labels == 0:
+        log.warning("no labelled pool in the %d scored chips: mAP is 0", len(paths))
+    average_precisions = []
+    for iou in MAP_IOU_THRESHOLDS:
+        flags = [
+            flag
+            for name, preds in predictions.items()
+            for flag in _hit_flags(preds, labels.get(name, []), iou)
+        ]
+        average_precisions.append(_average_precision(flags, n_labels))
+    return {"map50": average_precisions[0], "map50_95": float(np.mean(average_precisions))}
 
 
 def score_session(
