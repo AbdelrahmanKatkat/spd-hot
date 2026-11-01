@@ -108,12 +108,12 @@ outlines live in a local `research/` folder (not committed): dataset-specific co
 
 ## From a pipeline step (what a fAIr-models pack calls)
 
-A step trains from the original chips and GeoJSON. The Ultralytics folder it needs holds **links to the chips** (a
-symlink, else a hardlink; it fails instead of copying) and one small label file per chip, so it costs a few kilobytes
-per chip, not the chips again. Create it in a temporary folder so nothing outlives the step. Linking needs a symlink
-(Linux containers allow it) or, failing that, a hardlink, which needs the same drive as the chips: on Windows without
-symlink rights put the temporary folder on the chips' drive (`tempfile.TemporaryDirectory(dir=...)`), or
-`write_yolo_dataset` raises instead of copying.
+A step trains from the original chips and GeoJSON. The Ultralytics folder it needs holds **links to the chips** and one
+small label file per chip, so it costs a few kilobytes per chip, not the chips again. Create it in a temporary folder so
+nothing outlives the step. A chip is linked with a symlink (Linux containers allow it), else a hardlink (it needs the same
+drive as the chips), else it is copied and `write_yolo_dataset` logs one warning with the count: that happens on Windows
+without symlink rights, or with chips on another drive, and the copies last only until the folder is removed. To avoid the
+copies there, create the temporary folder on the chips' drive (`tempfile.TemporaryDirectory(dir=...)`).
 
 ```python
 import tempfile

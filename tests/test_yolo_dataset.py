@@ -1,3 +1,7 @@
+import logging
+import os
+from pathlib import Path
+
 import pytest
 
 from spd_hot.yolo_dataset import remove_yolo_dataset, write_yolo_dataset, yolo_label_line
@@ -61,3 +65,32 @@ def test_a_folder_that_is_not_a_yolo_dataset_is_never_removed(tmp_path):
     with pytest.raises(ValueError):
         remove_yolo_dataset(other)
     assert (other / "keep.txt").read_text(encoding="utf-8") == "preserve"
+
+
+def _refuse(*_args, **_kwargs):
+    raise OSError("not supported here")
+
+
+def test_a_chip_is_copied_with_a_warning_when_nothing_can_link(chips_dir, tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(Path, "symlink_to", _refuse)
+    monkeypatch.setattr(os, "link", _refuse)
+
+    with caplog.at_level(logging.WARNING, logger="spd_hot.yolo_dataset"):
+        out = write_yolo_dataset(
+            chips_dir, {}, train_names=[CHIP_NAME], val_names=[], out_dir=tmp_path / "yolo"
+        )
+
+    copy = out / "images" / "train" / CHIP_NAME
+    assert copy.is_file() and not copy.is_symlink()
+    assert copy.read_bytes() == (chips_dir / CHIP_NAME).read_bytes()
+    assert "1 of 1 chips were copied" in caplog.text
+
+
+def test_nothing_is_copied_or_warned_when_linking_works(chips_dir, tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="spd_hot.yolo_dataset"):
+        out = write_yolo_dataset(
+            chips_dir, {}, train_names=[CHIP_NAME], val_names=[], out_dir=tmp_path / "yolo"
+        )
+
+    assert (out / "images" / "train" / CHIP_NAME).is_file()
+    assert "were copied" not in caplog.text
