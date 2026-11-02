@@ -18,6 +18,39 @@ def test_none_and_missing_keys_give_the_defaults():
     assert (train.epochs, train.freeze_encoder, train.device) == (10, True, "auto")
 
 
+def test_the_training_defaults_are_mozillas_with_a_frozen_backbone():
+    train = parse_train_params(None)
+    assert (train.epochs, train.batch_size, train.learning_rate, train.optimizer) == (10, 16, 0.01, "AdamW")
+    assert (train.patience, train.cos_lr, train.flipud, train.scale, train.translate) == (
+        3,
+        True,
+        0.5,
+        0.0,
+        0.0,
+    )
+    assert train.freeze_encoder is True  # not Mozilla's: the backbone keeps what it learned
+
+
+def test_the_augmentation_and_stopping_can_be_overridden():
+    train = parse_train_params(
+        {"patience": 0, "cos_lr": False, "flipud": 0.0, "scale": 0.3, "translate": 0.1, "batch_size": 4}
+    )
+    assert (train.patience, train.cos_lr, train.flipud, train.scale, train.translate) == (
+        0,
+        False,
+        0.0,
+        0.3,
+        0.1,
+    )
+    assert train.batch_size == 4
+
+
+@pytest.mark.parametrize("params", [{"patience": -1}, {"flipud": 1.5}, {"scale": -0.1}, {"translate": 2}])
+def test_out_of_range_augmentation_is_refused(params):
+    with pytest.raises(ValueError):
+        parse_train_params(params)
+
+
 def test_the_optimizer_is_explicit_and_auto_is_refused():
     assert parse_train_params(None).optimizer == "AdamW"
     assert parse_train_params({"optimizer": "SGD"}).optimizer == "SGD"

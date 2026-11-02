@@ -36,6 +36,12 @@ coordinates.
 | Normalisation | Only the division by 255 in `preprocess.py`. The ONNX graph has none (its first node is a convolution) and Ultralytics uses no mean or std |
 | Input size | 512, the size of training (`params.MODEL_INPUT_SIZE`) |
 
+**Fine-tuning defaults** (`TrainParams`) are Mozilla's: AdamW with `lr0=0.01`, 10 epochs, batch 16, patience 3, a cosine
+schedule, vertical flips at 0.5, and no scale or translation augmentation. One difference is deliberate: the first 10
+layers (the backbone) stay frozen, which Mozilla did not do, so the backbone keeps what it learned and the neck and head
+adapt. `device` is `auto`: a visible CUDA GPU is used when there is one, and training falls back to the CPU with a
+warning when there is none; `cuda`, `gpu`, a GPU index or `0,1` choose explicitly.
+
 **Use zoom 18.** One training pixel is `40075016.686 * cos(lat) / 2^18 / 512`, about `0.2986 * cos(lat)` m. A 256 px
 chip of a zoom-18 tile covers the same ground as a training image, so resizing it to 512 gives the training scale. The
 resize does not read the chip's zoom, so chips of another zoom are **not** brought to that scale: at zoom 20 pools look

@@ -56,18 +56,31 @@ class PostprocessParams:
 
 @dataclass(frozen=True)
 class TrainParams:
-    """Ultralytics fine-tuning knobs. `freeze_encoder` freezes the YOLO11 backbone, so the neck and the head adapt.
+    """Ultralytics fine-tuning knobs. The defaults are those of Mozilla's training of the base model
+    (`osm-ai-helper`, `demo/finetune_model.ipynb`, with Ultralytics' defaults for what it leaves out), except
+    `freeze_encoder`: the YOLO11 backbone (the first 10 layers) stays frozen, so the neck and the head adapt and the
+    backbone keeps what it learned instead of forgetting it.
 
     The optimizer is explicit, AdamW as in Mozilla's training: with Ultralytics' own `auto` choice `learning_rate` is
-    ignored and a learning rate is picked from the dataset size.
+    ignored and a learning rate is picked from the dataset size. Mozilla's augmentation keeps vertical flips (pools seen
+    from above have no up) and turns off scaling and translation.
     """
 
     epochs: int = 10
-    batch_size: int = 8
+    batch_size: int = 16
     learning_rate: float = 0.01
     optimizer: str = "AdamW"
+    patience: int = (
+        3  # epochs without a better validation fitness before training stops (0 never stops early)
+    )
+    cos_lr: bool = True  # cosine learning-rate schedule
+    flipud: float = 0.5  # probability of a vertical flip
+    scale: float = 0.0  # scale augmentation gain
+    translate: float = 0.0  # translation augmentation, as a fraction of the image
     freeze_encoder: bool = True
-    device: str = "auto"  # cuda if visible, else cpu (training is meant to run on a GPU)
+    device: str = (
+        "auto"  # a visible CUDA GPU if there is one, else the CPU (training is meant to run on a GPU)
+    )
 
 
 def _get(mapping: Mapping[str, Any], keys: tuple[str, ...], default: Any) -> Any:
@@ -178,11 +191,19 @@ def parse_train_params(params: Mapping[str, Any] | None) -> TrainParams:
             f"optimizer must be a named optimizer such as AdamW or SGD, got {optimizer!r}: "
             "'auto' ignores learning_rate"
         )
+    patience = _as_int(_get(given, ("patience",), TrainParams.patience))
+    if patience < 0:
+        raise ValueError(f"patience must be >= 0, got {patience}")
     return TrainParams(
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
         optimizer=optimizer,
+        patience=patience,
+        cos_lr=_as_bool(_get(given, ("cos_lr",), TrainParams.cos_lr)),
+        flipud=_check_unit("flipud", _as_float(_get(given, ("flipud",), TrainParams.flipud))),
+        scale=_check_unit("scale", _as_float(_get(given, ("scale",), TrainParams.scale))),
+        translate=_check_unit("translate", _as_float(_get(given, ("translate",), TrainParams.translate))),
         freeze_encoder=_as_bool(
             _get(given, ("freeze_encoder", "freeze_backbone"), TrainParams.freeze_encoder)
         ),
